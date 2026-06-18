@@ -29,7 +29,13 @@ import java.nio.ByteBuffer;
 public final class LightBuffer
 {
     public static final int BINDING = 7;
-    public static final int MAX_LIGHTS = 256;
+    // Hard ceiling on simultaneous lights in the SSBO. Raised to 2048 to back the
+    // editor's "Max sources" slider (auto block-lights). NOTE: the injected GLSL
+    // loops over irlite_lightCount PER FRAGMENT, so the real-world limit is
+    // performance, not this number — pushing the slider into the hundreds/thousands
+    // gets very expensive. The shader array is unbounded (std430 []), so no pack
+    // needs regenerating for a larger ceiling. SSBO size = 16 + 2048*80 ≈ 164 KB.
+    public static final int MAX_LIGHTS = 2048;
 
     private static final int HEADER_BYTES = 16;     // uint count + 12 B pad (std430 vec4 align)
     private static final int LIGHT_BYTES = 80;      // 5 × vec4
