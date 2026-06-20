@@ -35,6 +35,11 @@ public final class LightRegistry
     private static final float[] density = new float[MAX];
     private static final float[] beam = new float[MAX];
     private static final float[] bulbSize = new float[MAX];
+    // Spot gobo/cookie (-1 layer = none); see LightBuffer cookie vec4. Point lights ignore these.
+    private static final float[] cookieLayer = new float[MAX];
+    private static final float[] cookieRot = new float[MAX];
+    private static final float[] cookieScale = new float[MAX];
+    private static final float[] cookieFlags = new float[MAX];
     private static final boolean[] shadows = new boolean[MAX];
     private static final int[] shadowTile = new int[MAX];
     private static final long[] id = new long[MAX];
@@ -63,7 +68,14 @@ public final class LightRegistry
         bulbSize[i] = bulb; shadows[i] = castsShadows;
     }
 
+    /** No-cookie overload (the BBS addon's call path): delegates with the gobo
+     *  disabled (layer -1). Keeps the addon ABI stable across the cookie struct bump. */
     public static void registerSpot(float x, float y, float z, float ndx, float ndy, float ndz, float r, float g, float b, float in, float range, float cosO, float cosI, boolean eOnly, boolean bOnly, float aniso, float dens, float bm, float bulb, boolean castsShadows, long identity)
+    {
+        registerSpot(x, y, z, ndx, ndy, ndz, r, g, b, in, range, cosO, cosI, eOnly, bOnly, aniso, dens, bm, bulb, castsShadows, -1F, 0F, 1F, 0F, identity);
+    }
+
+    public static void registerSpot(float x, float y, float z, float ndx, float ndy, float ndz, float r, float g, float b, float in, float range, float cosO, float cosI, boolean eOnly, boolean bOnly, float aniso, float dens, float bm, float bulb, boolean castsShadows, float cLayer, float cRot, float cScale, float cFlags, long identity)
     {
         int i = slot(identity);
         if (i < 0)
@@ -80,6 +92,7 @@ public final class LightRegistry
         entitiesOnly[i] = eOnly; blocksOnly[i] = bOnly;
         anisotropy[i] = aniso; density[i] = dens; beam[i] = bm;
         bulbSize[i] = bulb; shadows[i] = castsShadows;
+        cookieLayer[i] = cLayer; cookieRot[i] = cRot; cookieScale[i] = cScale; cookieFlags[i] = cFlags;
     }
 
     /** Returns the slot for this identity (existing = overwrite, else a new one), or -1 if full. */
@@ -100,6 +113,8 @@ public final class LightRegistry
 
         id[count] = identity;
         shadowTile[count] = -1;
+        cookieLayer[count] = -1F;
+        cookieScale[count] = 1F;
         return count++;
     }
 
@@ -165,7 +180,7 @@ public final class LightRegistry
             }
             else
             {
-                LightBuffer.addSpot(px[i], py[i], pz[i], dx[i], dy[i], dz[i], cr[i], cg[i], cb[i], intensity[i], radius[i], cosOuter[i], cosInner[i], lightMask, anisotropy[i], density[i], beam[i], (float) shadowTile[i], bulbSize[i]);
+                LightBuffer.addSpot(px[i], py[i], pz[i], dx[i], dy[i], dz[i], cr[i], cg[i], cb[i], intensity[i], radius[i], cosOuter[i], cosInner[i], lightMask, anisotropy[i], density[i], beam[i], (float) shadowTile[i], bulbSize[i], cookieLayer[i], cookieRot[i], cookieScale[i], cookieFlags[i]);
             }
         }
 

@@ -18,6 +18,7 @@ import java.nio.ByteBuffer;
  *       vec4 dirType;         // xyz = direction (spot, normalized), w = type (0 point, 1 spot)
  *       vec4 cone;            // x = cos(outerAngle/2), y = cos(innerAngle/2), z = lightMask (0 all, 1 entities only, 2 blocks only), w = bulbSize (0 = use global)
  *       vec4 vlParams;        // x = anisotropy (HG g), y = vlDensity, z = beamStrength, w = shadowTile (-1 = none)
+ *       vec4 cookie;          // x = gobo layer (-1 = none), y = rotation (rad), z = scale, w = flags (bit0 = invert) — spot-only projected mask
  *   };
  *
  *   layout(std430, binding = BINDING) buffer IrliteLights {
@@ -38,7 +39,7 @@ public final class LightBuffer
     public static final int MAX_LIGHTS = 2048;
 
     private static final int HEADER_BYTES = 16;     // uint count + 12 B pad (std430 vec4 align)
-    private static final int LIGHT_BYTES = 80;      // 5 × vec4
+    private static final int LIGHT_BYTES = 96;      // 6 × vec4
     private static final int CAPACITY = HEADER_BYTES + MAX_LIGHTS * LIGHT_BYTES;
 
     private static int ssbo = 0;
@@ -90,11 +91,12 @@ public final class LightBuffer
         scratch.putFloat(0F).putFloat(0F).putFloat(0F).putFloat(0F);  // dir=0, type=point
         scratch.putFloat(1F).putFloat(1F).putFloat(lightMask).putFloat(bulbSize);  // cone: full, z=lightMask (0 all/1 entities/2 blocks), w=bulbSize
         scratch.putFloat(anisotropy).putFloat(density).putFloat(beam).putFloat(shadowTile);
+        scratch.putFloat(-1F).putFloat(0F).putFloat(1F).putFloat(0F);  // cookie: none (gobo is spot-only)
 
         count++;
     }
 
-    public static void addSpot(float x, float y, float z, float dx, float dy, float dz, float r, float g, float b, float intensity, float radius, float cosOuter, float cosInner, float lightMask, float anisotropy, float density, float beam, float shadowTile, float bulbSize)
+    public static void addSpot(float x, float y, float z, float dx, float dy, float dz, float r, float g, float b, float intensity, float radius, float cosOuter, float cosInner, float lightMask, float anisotropy, float density, float beam, float shadowTile, float bulbSize, float cookieLayer, float cookieRot, float cookieScale, float cookieFlags)
     {
         if (count >= MAX_LIGHTS)
         {
@@ -106,6 +108,7 @@ public final class LightBuffer
         scratch.putFloat(dx).putFloat(dy).putFloat(dz).putFloat(1F);   // type=spot
         scratch.putFloat(cosOuter).putFloat(cosInner).putFloat(lightMask).putFloat(bulbSize);  // z=lightMask (0 all/1 entities/2 blocks), w=bulbSize
         scratch.putFloat(anisotropy).putFloat(density).putFloat(beam).putFloat(shadowTile);
+        scratch.putFloat(cookieLayer).putFloat(cookieRot).putFloat(cookieScale).putFloat(cookieFlags);  // cookie: x=gobo layer(-1 none), y=rot, z=scale, w=flags
 
         count++;
     }
