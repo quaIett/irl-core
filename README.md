@@ -2,7 +2,7 @@
 
 # ✦ irl-core
 
-**The BBS-free shared engine behind IRLights & IRL-redactor**
+**The BBS-free shared engine behind IRLights & IRL-editor**
 
 *A plain-Java library — zero Minecraft, zero Loom — that holds the light SSBO pipeline and the `.irlights` shaderpack patcher. One Java&nbsp;17 jar serves every Minecraft version.*
 
@@ -19,7 +19,7 @@
 `irl-core` is the common heart of two sibling mods:
 
 - **[IRLights](https://github.com/quaIett/bbs-irlights-addon)** — a BBS Mod Studio add-on
-- **[IRL-redactor](https://github.com/quaIett/irlights)** — a standalone ImGui light editor
+- **[IRL-editor](https://github.com/quaIett/irl-editor)** — a standalone ImGui light editor
 
 It contains everything that has **no dependency on Minecraft or Fabric**: the GPU light buffer and the shaderpack patcher. Because it touches zero Minecraft types, a **single Java&nbsp;17 build** runs unchanged on every consumer (MC&nbsp;1.20.1 → 1.21.11, Java&nbsp;17 → 21).
 
@@ -71,7 +71,7 @@ Requires a JDK 17+. The library compiles with `--release 17`; the resulting byte
 |---|---|
 | **irl-core** *(this repo)* | Shared engine: light SSBO + `.irlights` patcher |
 | [bbs-irlights-addon](https://github.com/quaIett/bbs-irlights-addon) | IRLights — BBS Mod Studio add-on |
-| [irlights](https://github.com/quaIett/irlights) | IRL-redactor — standalone ImGui editor |
+| [irl-editor](https://github.com/quaIett/irl-editor) | IRL-editor — standalone ImGui editor |
 
 ---
 
