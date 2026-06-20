@@ -13,7 +13,7 @@ a hard failure with the differing lines shown side by side.
 
 Run from anywhere; the script locates both sibling repos relative to its own
 location (`<BBS>/irl-core/tools/verify-shadow-lockstep.py` ->
-`<BBS>/IRL-redactor` + `<BBS>/IRLite`). Override with env vars
+`<BBS>/irlights` + `<BBS>/bbs-irlights-addon`). Override with env vars
 `IRL_REDACTOR_DIR` / `IRLITE_DIR` if needed.
 
 Exit codes: 0 = lockstep intact; 1 = drift detected; 2 = setup error
@@ -102,8 +102,8 @@ def resolve_repos() -> tuple[Path, Path]:
     vars, falls back to siblings of irl-core (the script's grandparent)."""
     here = Path(__file__).resolve()
     bbs_root = here.parent.parent.parent  # tools -> irl-core -> BBS
-    red = Path(os.environ.get("IRL_REDACTOR_DIR", bbs_root / "IRL-redactor"))
-    irl = Path(os.environ.get("IRLITE_DIR", bbs_root / "IRLite"))
+    red = Path(os.environ.get("IRL_REDACTOR_DIR", bbs_root / "irlights"))
+    irl = Path(os.environ.get("IRLITE_DIR", bbs_root / "bbs-irlights-addon"))
     return red.resolve(), irl.resolve()
 
 
