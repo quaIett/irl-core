@@ -9,7 +9,7 @@ plugins {
 }
 
 group = 'org.qualet'
-version = '1.0.0'
+version = '1.0-obt'
 
 java {
     // Target the LOWEST consumer (IRLite on MC 1.20.x = Java 17). Java-17 bytecode
