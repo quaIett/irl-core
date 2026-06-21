@@ -8,5 +8,6 @@
         "qualet"
     ],
     "license": "MIT",
+    "icon": "assets/irl-core/icon.png",
     "environment": "*"
 }
