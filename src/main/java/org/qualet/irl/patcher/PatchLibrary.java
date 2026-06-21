@@ -7,8 +7,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.stream.Stream;
@@ -61,8 +61,14 @@ public final class PatchLibrary
         Patcher.host().openFolder(dir());
     }
 
-    /** Unpacks any bundled patch (from the host) missing from {@code dir}. Runs at most
-     *  once per session; a file the user already placed or edited is never overwritten. */
+    /** Syncs the bundled patches (from the host) into {@code dir} so they track the mod jar.
+     *  A bundled file is (re)written whenever its on-disk bytes differ from the jar's copy:
+     *  this unpacks missing files and, crucially, refreshes stale ones left over from an older
+     *  jar (e.g. a patch missing a newly added op) — keeping the canonical set in lockstep with
+     *  the SSBO struct contract so an updated mod can't be defeated by leftover disk files.
+     *  Runs at most once per session. User-authored patches use their own file names (never in
+     *  {@link PatcherHost#bundledPatches()}) and are untouched; to keep a hand-edited variant of
+     *  a bundled patch, save it under a different name. */
     private static void extractBundled(Path dir, PatcherHost host)
     {
         if (extracted)
@@ -74,18 +80,20 @@ public final class PatchLibrary
         for (String name : host.bundledPatches())
         {
             Path target = dir.resolve(name);
-            if (Files.exists(target))
-            {
-                continue;
-            }
             try (InputStream in = host.openBundledPatch(name))
             {
                 if (in == null)
                 {
                     continue;
                 }
-                Files.copy(in, target, StandardCopyOption.REPLACE_EXISTING);
-                LOG.info("Unpacked bundled patch: {}", name);
+                byte[] bundled = in.readAllBytes();
+                byte[] current = Files.exists(target) ? Files.readAllBytes(target) : null;
+                if (Arrays.equals(bundled, current))
+                {
+                    continue;
+                }
+                Files.write(target, bundled);
+                LOG.info("{} bundled patch: {}", current == null ? "Unpacked" : "Refreshed", name);
             }
             catch (IOException e)
             {
