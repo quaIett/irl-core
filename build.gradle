@@ -29,6 +29,17 @@ repositories {
     mavenCentral()
 }
 
+// Bake the Gradle version into the bundled fabric.mod.json. This jar carries its own
+// mod metadata (id "irl-core") so each consumer can declare a hard `depends` on it:
+// Fabric Loader then refuses to start with a clear "requires irl-core" error if this
+// nested jar is ever stripped, instead of a runtime NoClassDefFoundError.
+processResources {
+    inputs.property "version", version
+    filesMatching("fabric.mod.json") {
+        expand "version": version
+    }
+}
+
 dependencies {
     // All supplied by the consuming Minecraft/Fabric runtime, so compileOnly: they
     // are referenced for compilation but NOT bundled into the core jar.

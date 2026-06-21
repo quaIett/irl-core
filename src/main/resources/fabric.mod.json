@@ -1,0 +1,12 @@
+{
+    "schemaVersion": 1,
+    "id": "irl-core",
+    "version": "${version}",
+    "name": "IRL Core",
+    "description": "BBS-free shared engine for IRLite and IRL-redactor: the light SSBO/registry and the .irlights shader patcher. Bundled (JiJ) inside each mod — it is a required dependency, never installed on its own.",
+    "authors": [
+        "qualet"
+    ],
+    "license": "MIT",
+    "environment": "*"
+}
