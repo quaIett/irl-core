@@ -1,19 +1,30 @@
 // irl-core — the BBS-free shared engine for IRLite and IRL-redactor.
-// Plain Java library (NO fabric-loom, NO Minecraft): the light SSBO + registry and
-// the .irlights shader patcher. Consumed by both mods via a Gradle composite build
-// (settings.gradle: includeBuild("../irl-core")) and bundled into each mod jar with
-// Loom's `include`. One Java-17 jar serves every MC version (1.20.1 / 1.20.4 / 1.21.11)
-// because it has zero Minecraft types.
+// Per-version Fabric/Loom module (this branch = MC 1.20.4 reference line): the light
+// SSBO + registry, the .irlights shader patcher, AND the MC-typed shadow orchestration
+// (moved out of both mods in Ф2 of plan-irl-core-shadow-extraction).
+//
+// Built with Loom 1.9 — the OLDEST consumer's Loom. Ф0 PoC finding: a jar built by a
+// NEWER Loom is rejected by an older-Loom consumer ("Mod was built with a newer version
+// of Loom"); the check is one-directional. So core is built with 1.9 and BOTH the
+// redactor (Loom 1.9) and the addon (Loom 1.15.5) accept it. Published as a remapped
+// (intermediary) jar to mavenLocal; each mod consumes it with modClientImplementation
+// (remap intermediary -> named) + include (JiJ). intermediary names are MC-version
+// specific, so this artifact pairs with MC 1.20.4 consumers only (addon -> -Pmc=1.20.4).
 plugins {
-    id 'java-library'
+    id 'fabric-loom' version '1.9-SNAPSHOT'
+    id 'maven-publish'
 }
 
 group = 'org.qualet'
 version = '1.0-obt'
 
+base {
+    archivesName = 'irl-core'
+}
+
 java {
     // Target the LOWEST consumer (IRLite on MC 1.20.x = Java 17). Java-17 bytecode
-    // runs unchanged on the Java-21 runtime (IRL-redactor on 1.21.11).
+    // runs unchanged on the Java-21 runtimes (the 1.21.x lines).
     sourceCompatibility = JavaVersion.VERSION_17
     targetCompatibility = JavaVersion.VERSION_17
     withSourcesJar()
@@ -25,8 +36,20 @@ tasks.withType(JavaCompile).configureEach {
 }
 
 repositories {
-    // Composite builds do NOT inherit repositories from the consumers — declare here.
+    // Loom registers the Mojang + FabricMC mavens itself; only extra coords go here.
     mavenCentral()
+}
+
+dependencies {
+    // MC 1.20.4 reference line. mappings (yarn) let the shadow orchestration compile
+    // against named Minecraft; Loom remaps the published jar back to intermediary.
+    minecraft "com.mojang:minecraft:1.20.4"
+    mappings "net.fabricmc:yarn:1.20.4+build.1:v2"
+    modImplementation "net.fabricmc:fabric-loader:0.16.14"
+
+    // slf4j: the light/patcher loggers. Bundled by Fabric Loader at runtime, so
+    // compileOnly (not bundled into the core jar).
+    compileOnly 'org.slf4j:slf4j-api:2.0.9'
 }
 
 // Bake the Gradle version into the bundled fabric.mod.json. This jar carries its own
@@ -40,13 +63,21 @@ processResources {
     }
 }
 
-dependencies {
-    // All supplied by the consuming Minecraft/Fabric runtime, so compileOnly: they
-    // are referenced for compilation but NOT bundled into the core jar.
-    //   - LWJGL OpenGL bindings: LightBuffer's GL SSBO calls. Pin to 3.3.1 (lowest
-    //     runtime, MC 1.20.1); OpenGL bindings are additive-stable across 3.3.x.
-    //   - slf4j-api: bundled by Fabric Loader at runtime in both mods.
-    compileOnly 'org.lwjgl:lwjgl:3.3.1'
-    compileOnly 'org.lwjgl:lwjgl-opengl:3.3.1'
-    compileOnly 'org.slf4j:slf4j-api:2.0.9'
+// Publish the REMAPPED (intermediary) jar to mavenLocal. Loom wires remapJar into
+// components.java, so `from components.java` carries the intermediary artifact (the
+// consumers' Loom then remaps it to their named mappings). Dev workflow: run
+// `gradlew publishToMavenLocal` here BEFORE building either mod.
+publishing {
+    publications {
+        create("mavenJava", MavenPublication) {
+            artifactId = 'irl-core'
+            from components.java
+        }
+    }
+}
+
+jar {
+    from("LICENSE") {
+        rename { "${it}_${project.base.archivesName.get()}" }
+    }
 }

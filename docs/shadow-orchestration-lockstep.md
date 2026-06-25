@@ -1,4 +1,17 @@
-# Shadow-orchestration lockstep (Ф4)
+# Shadow-orchestration lockstep (Ф4) — RETIRED
+
+> **RETIRED 2026-06-25 — superseded by the irl-core extraction (Ф2 of
+> `plan-irl-core-shadow-extraction`).** The orchestration this document tracks is no
+> longer duplicated: Ф2 moved all 14 files into the per-version `irl-core` Loom module
+> (`org.qualet.irl.light.shadow`) behind the `ShadowConfig` + `ShadowEngine` seams
+> (see [shadow-config-source-injection-spec.md](shadow-config-source-injection-spec.md)).
+> One copy now ⇒ nothing to keep in lockstep; `tools/verify-shadow-lockstep.py` is
+> retired to a stub. The "option (a) shared module" rejected below became cheap
+> precisely because the core went **per-version** (one Loom per MC line kills the
+> 1.9 ↔ 1.15.5 composite friction), `LightRegistry` had already migrated to irl-core,
+> and per-version MC-coupling is the intended design — so all three blockers listed
+> under "Ф4 rejected option (a)" no longer hold. The text below is the historical Ф4
+> record (option C+), kept for the audit trail.
 
 > **Status: ACTIVE (option C+).** Phase 4 of `plan-shadow-seam-refactor`.
 > Established 2026-06-17 after Ф3 brought IRLite and redactor-main onto the
