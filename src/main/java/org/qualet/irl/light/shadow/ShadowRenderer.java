@@ -253,6 +253,20 @@ public final class ShadowRenderer
         // scratch MatrixStack until the single end-of-batch flush, which re-asserts the
         // same matrices). See irl-core/docs/shadow-caster-seam-spec.md INV-1 erratum.
         establishLightMatrices(currentView, currentProj);
+        // MAJOR-A analog for NON-matrix GL state. beginCasterBatch pins the bake's
+        // depth state ONCE per pass, but a self-drawing caster can mutate it mid-pass:
+        // e.g. a BBS form item held by the local-player occluder renders through a BBS
+        // FormRenderer that calls RenderSystem.disableDepthTest() and leaves blend on
+        // (exactly as MorphRenderer does), so the caster emitted NEXT in the same pass
+        // — notably a model block whose form self-draws via glDrawArrays — would bake
+        // with depthTest OFF and land nothing in the depth map: its shadow silently
+        // vanishes with no GL error (the same failure renderBlocksDepth dodges by
+        // passing matrices explicitly). establishLightMatrices repairs the matrices but
+        // not depthMask/depthTest/blend; re-pin them before EVERY emit so each caster
+        // starts from the pinned bake state regardless of what the previous one left.
+        RenderSystem.depthMask(true);
+        RenderSystem.enableDepthTest();
+        RenderSystem.disableBlend();
         try
         {
             source.emitOccluder(caster, casterType, tickDelta, casterBatch);
