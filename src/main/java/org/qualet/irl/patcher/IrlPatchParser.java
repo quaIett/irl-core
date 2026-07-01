@@ -114,6 +114,14 @@ public final class IrlPatchParser
             {
                 patch.marker = line.substring(8).trim();
             }
+            else if (line.equals("@dof") || line.startsWith("@dof "))
+            {
+                String value = line.length() > 4 ? line.substring(4).trim() : "";
+                patch.dof = value.isEmpty()
+                    || value.equals("1")
+                    || value.equalsIgnoreCase("true")
+                    || value.equalsIgnoreCase("yes");
+            }
             else if (line.startsWith("+file "))
             {
                 String path = normalize(line.substring(6).trim());

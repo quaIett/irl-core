@@ -48,5 +48,6 @@ public final class IrlPatch
     public String packVersion = "";     // informational: pack version the patch was authored against
     public String marker = "IRLITE";
     public int irliteVersion = 0;       // 0 = patch does not pin a contract version
+    public boolean dof = false;         // combined lights+DOF combo: host appends "+DOF" to the patched pack name
     public final List<Op> ops = new ArrayList<>();
 }
