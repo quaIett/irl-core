@@ -558,6 +558,7 @@ public final class ShadowBaker
                     }
                     ShadowRenderer.endPass();
                 }
+                PointShadowPyramid.markDirty(myLayer);
                 rememberLive(id, sig, myLayer, blocks, dyn);
                 continue;
             }
@@ -593,6 +594,7 @@ public final class ShadowBaker
                             }
                             ShadowRenderer.endPass();
                         }
+                        PointShadowPyramid.markDirty(myLayer);
                         rememberLive(id, sig, myLayer, blocks, false);
                     }
                     // else deferred: keep our own (older) live cube; dirty state
@@ -711,6 +713,8 @@ public final class ShadowBaker
                     ShadowRenderer.endPass();
                 }
             }
+            // overlay mode rewrites live faces every frame (copies + dynamics) -> pyramid follows every frame
+            PointShadowPyramid.markDirty(myLayer);
 
             if (dyn)
             {
@@ -721,6 +725,9 @@ public final class ShadowBaker
                 rememberLive(id, sig, myLayer, blocks, false);
             }
         }
+
+        // one batched pyramid pass over every slot the point loop dirtied (before the SSBO flush / Iris passes)
+        PointShadowPyramid.flushDirty();
 
         // Defensive invariant sweep: per-light dirty state may only exist for
         // current tile owners (steals and resets purge eagerly; this catches

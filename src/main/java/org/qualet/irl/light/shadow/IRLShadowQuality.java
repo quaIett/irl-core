@@ -10,9 +10,9 @@ package org.qualet.irl.light.shadow;
  *   MEDIUM spot 1024² (64 MiB) + point 512² (96 MiB)  = ~160 MiB
  *   HIGH   spot 2048² (256MiB) + point 1024²(384 MiB) = ~640 MiB
  *   ULTRA  spot 4096² (1 GiB)  + point 2048²(1.5 GiB) = ~2.5 GiB
- * Plus the spot min/max pyramid (SpotShadowPyramid, RG32F base=atlas/2 + mips
- * = ~2/3 of the live spot atlas): LOW ~11 MiB, MEDIUM ~43 MiB, HIGH ~171 MiB,
- * ULTRA ~683 MiB.
+ * Plus the min/max pyramids (RG32F base=map/2 + mips = ~2/3 of the live map):
+ *   spot  (SpotShadowPyramid):  LOW ~11 MiB, MEDIUM ~43 MiB, HIGH ~171 MiB, ULTRA ~683 MiB
+ *   point (PointShadowPyramid): LOW ~17 MiB, MEDIUM ~67 MiB, HIGH ~268 MiB, ULTRA ~1.02 GiB
  */
 public enum IRLShadowQuality
 {
