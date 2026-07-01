@@ -176,9 +176,13 @@ public final class SpotlightDepthAtlas
 
     public static void delete()
     {
+        SpotShadowPyramid.delete(); // pyramid base size tracks the atlas size
+        // _deleteTexture (not raw glDeleteTextures): drops the id from GlStateManager's
+        // per-unit binding cache — a raw delete leaves a stale entry that silently
+        // skips a future bind when the driver reuses the name.
         if (initialized)
         {
-            GL11.glDeleteTextures(glTextureId);
+            GlStateManager._deleteTexture(glTextureId);
             GL30.glDeleteFramebuffers(glFboId);
             glTextureId = 0;
             glFboId = 0;
@@ -186,7 +190,7 @@ public final class SpotlightDepthAtlas
         }
         if (staticInitialized)
         {
-            GL11.glDeleteTextures(staticTextureId);
+            GlStateManager._deleteTexture(staticTextureId);
             GL30.glDeleteFramebuffers(staticFboId);
             staticTextureId = 0;
             staticFboId = 0;

@@ -359,6 +359,7 @@ public final class ShadowBaker
                     ShadowRenderer.renderBlocksDepth(id, blocks);
                 }
                 ShadowRenderer.endPass();
+                SpotShadowPyramid.markDirty(myTile);
                 rememberLive(id, sig, myTile, blocks, dyn);
                 continue;
             }
@@ -393,6 +394,7 @@ public final class ShadowBaker
                             ShadowRenderer.renderBlocksDepth(id, blocks);
                         }
                         ShadowRenderer.endPass();
+                        SpotShadowPyramid.markDirty(myTile);
                         rememberLive(id, sig, myTile, blocks, false);
                     }
                     // else deferred: keep our own (older) live map and leave the
@@ -473,6 +475,8 @@ public final class ShadowBaker
                 }
                 ShadowRenderer.endPass();
             }
+            // overlay mode rewrites the live tile every frame (copy + dynamics) -> pyramid follows every frame
+            SpotShadowPyramid.markDirty(myTile);
 
             if (dyn)
             {
@@ -484,6 +488,9 @@ public final class ShadowBaker
                 rememberLive(id, sig, myTile, blocks, false);
             }
         }
+
+        // one batched pyramid pass over every tile the spot loop dirtied (before the SSBO flush / Iris passes)
+        SpotShadowPyramid.flushDirty();
 
         // --- point lights: cube-array, 6 faces each ---
         for (int i = 0; i < n; i++)

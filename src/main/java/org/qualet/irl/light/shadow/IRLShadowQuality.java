@@ -4,11 +4,15 @@ package org.qualet.irl.light.shadow;
  * Shadow resolution presets. Switching a preset frees + re-inits both shadow
  * textures on next access (lazy). MEDIUM matches the default allocations.
  *
- * VRAM (16 spot tiles + 16 point cubes):
+ * VRAM (16 spot tiles + 16 point cubes, LIVE layer; the STATIC overlay layer
+ * lazily doubles each texture it is needed for):
  *   LOW    spot 512²  (16 MiB) + point 256² (24 MiB)  = ~40 MiB
  *   MEDIUM spot 1024² (64 MiB) + point 512² (96 MiB)  = ~160 MiB
  *   HIGH   spot 2048² (256MiB) + point 1024²(384 MiB) = ~640 MiB
  *   ULTRA  spot 4096² (1 GiB)  + point 2048²(1.5 GiB) = ~2.5 GiB
+ * Plus the spot min/max pyramid (SpotShadowPyramid, RG32F base=atlas/2 + mips
+ * = ~2/3 of the live spot atlas): LOW ~11 MiB, MEDIUM ~43 MiB, HIGH ~171 MiB,
+ * ULTRA ~683 MiB.
  */
 public enum IRLShadowQuality
 {
