@@ -199,6 +199,7 @@ public final class PointShadowArray
     public static void delete()
     {
         PointShadowPyramid.delete(); // pyramid base size tracks the face size
+        PointShadowEvsm.delete();    // EVSM base size tracks the face size too
         if (initialized)
         {
             GL11.glDeleteTextures(glTextureId);
@@ -218,8 +219,8 @@ public final class PointShadowArray
     }
 
     /** Switch per-face resolution; frees + re-inits both arrays on next access.
-     *  MUST stay a power of two: PointShadowPyramid's texel-center reads and its
-     *  GLSL lod math (findMSB, regionW shifts) rely on it. */
+     *  MUST stay a power of two: PointShadowPyramid's and PointShadowEvsm's
+     *  texel-center reads and their GLSL lod math (findMSB, shifts) rely on it. */
     public static void setFaceSize(int newSize)
     {
         if (newSize == FACE_SIZE)
