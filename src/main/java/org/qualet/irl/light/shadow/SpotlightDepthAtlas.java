@@ -177,6 +177,7 @@ public final class SpotlightDepthAtlas
     public static void delete()
     {
         SpotShadowPyramid.delete(); // pyramid base size tracks the atlas size
+        SpotShadowEvsm.delete();    // EVSM base size tracks the atlas size too
         // _deleteTexture (not raw glDeleteTextures): drops the id from GlStateManager's
         // per-unit binding cache — a raw delete leaves a stale entry that silently
         // skips a future bind when the driver reuses the name.
