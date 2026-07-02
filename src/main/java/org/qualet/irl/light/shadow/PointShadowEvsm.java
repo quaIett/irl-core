@@ -12,27 +12,36 @@ import org.lwjgl.opengl.GL42;
 import org.lwjgl.opengl.GL43;
 
 /**
- * EVSM4 prefilter of the LIVE point shadow cube-array (F2b). Face-major
- * GL_TEXTURE_2D_ARRAY (layer = slot*6 + face) like {@link PointShadowPyramid},
- * RGBA32F, base = face/2, Gaussian-blurred base + re-blurred mip chain like
- * {@link SpotShadowEvsm}. Sampled as {@code irl_pointEvsm} (registered 2D,
- * rebound to 2D_ARRAY by the host mixins) with one trilinear textureLod +
- * Chebyshev for wide point penumbras.
+ * MSM4 (Hamburger) prefilter of the LIVE point shadow cube-array (F2b, moment
+ * math swapped EVSM-&gt;MSM same day). Face-major GL_TEXTURE_2D_ARRAY (layer =
+ * slot*6 + face) like {@link PointShadowPyramid}, RGBA32F, base = face/2,
+ * Gaussian-blurred base + re-blurred mip chain like {@link SpotShadowEvsm}.
+ * Sampled as {@code irl_pointEvsm} (registered 2D, rebound to 2D_ARRAY by the
+ * host mixins) with one trilinear textureLod + the Hamburger 4MSM solver for
+ * wide point penumbras.
  *
- * Face seams: the blur is face-local (reads clamp at the face border), so
- * softness would mismatch across cube edges — the GLSL branch therefore takes
- * EVSM only when the whole filter footprint stays inside one face and falls
- * back to the cube-sampling PCF near edges (the pyramid edge-guard pattern).
- * No spherically-correct blur needed.
+ * Face seams: blur taps that fall off the face are remapped through direction
+ * space onto the angularly-adjacent texel of the neighbouring face (faceDir +
+ * its dominant-axis inverse), keeping the moment field continuous across cube
+ * edges at every mip — plain face-local clamping showed blur bands along the
+ * ±45° seams once Softness pushed the footprint onto coarse mips. The sampling
+ * side keeps only its half-texel UV clamp.
  *
- * Warp CONTRACT (mirror of the GLSL point branch): lz = (zdist - near)/(far -
- * near) where zdist is the linearized DOMINANT-AXIS distance decoded from the
- * stored perspective depth (near 0.05, far = the slot's light radius, passed
- * per slot at markDirty); wp = exp(+42 lz), wn = -exp(-8 lz).
+ * Moment CONTRACT (mirror of the GLSL point branch): lz = (zdist - near)/(far
+ * - near) where zdist is the linearized DOMINANT-AXIS distance decoded from
+ * the stored perspective depth (near 0.05, far = the slot's light radius,
+ * passed per slot at markDirty); stored = MSM4 moments (lz, lz^2, -lz^3,
+ * lz^4) for the Hamburger solver — EVSM warps could not darken crossing
+ * penumbras of two blockers (bimodal distribution), MSM4 handles them. The
+ * THIRD moment is stored NEGATED purely as the validity marker: readers gate
+ * on mm.z &lt; 0 (garbage/pyramid/cookie textures read back &gt;= 0) and flip the
+ * sign before solving. Class keeps its EVSM name to avoid mixin churn in both
+ * host mods (they reference this class by name for the irl_pointEvsm bind).
  */
 public final class PointShadowEvsm
 {
-    private static int texId = 0;      // EVSM: base = face/2, layers = 96, levels = log2(FACE_SIZE)
+    private static int texId = 0;      // MSM storage: 2D-array, base = face/2, layers = 96, levels = log2(FACE_SIZE) (compute-side identity)
+    private static int viewId = 0;     // CUBE_MAP_ARRAY texture view over texId: hardware-seamless trilinear sampling (what the pack binds)
     private static int tempId = 0;     // 6-layer (face/2)^2 array, ping-pong for the separable blur of one slot
     private static int levels = 0;
     private static int progConvert = 0, progBlur = 0, progMip = 0;
@@ -48,7 +57,7 @@ public final class PointShadowEvsm
         "layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;\n" +
         "layout(rgba32f, binding = 0) uniform writeonly image2DArray dst;\n";
 
-    // depth cube 2x2 -> linearized warped moments; dir from the inverse GL face table (see PointShadowPyramid)
+    // depth cube 2x2 -> linearized MSM4 moments (z, z2, -z3, z4); dir from the inverse GL face table (see PointShadowPyramid)
     private static final String CONVERT_SRC = COMMON +
         "uniform samplerCubeArray srcCube;\n" +
         "uniform float far;\n" +
@@ -78,14 +87,13 @@ public final class PointShadowEvsm
         "        float ndcZ = z01 * 2.0 - 1.0;\n" +
         "        float zdist = (2.0 * far * 0.05) / max((far + 0.05) - ndcZ * (far - 0.05), 1e-6);\n" +
         "        float lz = clamp((zdist - 0.05) / (far - 0.05), 0.0, 1.0);\n" +
-        "        float wp = exp(42.0 * lz);\n" +
-        "        float wn = -exp(-8.0 * lz);\n" +
-        "        m += vec4(wp, wp * wp, wn, wn * wn);\n" +
+        "        float lz2 = lz * lz;\n" +
+        "        m += vec4(lz, lz2, -(lz2 * lz), lz2 * lz2);\n" +
         "    }\n" +
         "    imageStore(dst, ivec3(g, slot * 6 + face), m * 0.25);\n" +
         "}\n";
 
-    // separable Gaussian 1-4-6-4-1, face-local (reads clamp at the face border); z = face
+    // separable Gaussian 1-4-6-4-1, cube-aware taps (off-face reads remap to the neighbour face); z = face
     private static final String BLUR_SRC = COMMON +
         "uniform sampler2DArray srcTex;\n" +
         "uniform int srcLod;\n" +
@@ -94,6 +102,44 @@ public final class PointShadowEvsm
         "uniform int dstLayerBase;\n" +
         "uniform ivec2 size;\n" +
         "const float W[5] = float[5](0.0625, 0.25, 0.375, 0.25, 0.0625);\n" +
+        "vec3 faceDir(int face, vec2 st)\n" +
+        "{\n" +
+        "    if (face == 0) return vec3( 1.0, -st.y, -st.x);\n" +
+        "    if (face == 1) return vec3(-1.0, -st.y,  st.x);\n" +
+        "    if (face == 2) return vec3( st.x,  1.0,  st.y);\n" +
+        "    if (face == 3) return vec3( st.x, -1.0, -st.y);\n" +
+        "    if (face == 4) return vec3( st.x, -st.y,  1.0);\n" +
+        "    return vec3(-st.x, -st.y, -1.0);\n" +
+        "}\n" +
+        "vec4 tap(int face, ivec2 p)\n" +
+        "{\n" +
+        "    if (p.x >= 0 && p.y >= 0 && p.x < size.x && p.y < size.y)\n" +
+        "    {\n" +
+        "        return texelFetch(srcTex, ivec3(p, srcLayerBase + face), srcLod);\n" +
+        "    }\n" +
+        "    vec2 st = ((vec2(p) + 0.5) / vec2(size)) * 2.0 - 1.0;\n" +
+        "    vec3 d = faceDir(face, st);\n" +
+        "    vec3 a = abs(d);\n" +
+        "    int f2;\n" +
+        "    vec2 st2;\n" +
+        "    if (a.x >= a.y && a.x >= a.z)\n" +
+        "    {\n" +
+        "        f2 = d.x > 0.0 ? 0 : 1;\n" +
+        "        st2 = vec2(d.x > 0.0 ? -d.z : d.z, -d.y) / a.x;\n" +
+        "    }\n" +
+        "    else if (a.y >= a.z)\n" +
+        "    {\n" +
+        "        f2 = d.y > 0.0 ? 2 : 3;\n" +
+        "        st2 = vec2(d.x, d.y > 0.0 ? d.z : -d.z) / a.y;\n" +
+        "    }\n" +
+        "    else\n" +
+        "    {\n" +
+        "        f2 = d.z > 0.0 ? 4 : 5;\n" +
+        "        st2 = vec2(d.z > 0.0 ? d.x : -d.x, -d.y) / a.z;\n" +
+        "    }\n" +
+        "    ivec2 q = clamp(ivec2((st2 * 0.5 + 0.5) * vec2(size)), ivec2(0), size - 1);\n" +
+        "    return texelFetch(srcTex, ivec3(q, srcLayerBase + f2), srcLod);\n" +
+        "}\n" +
         "void main()\n" +
         "{\n" +
         "    ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n" +
@@ -102,9 +148,8 @@ public final class PointShadowEvsm
         "    vec4 acc = vec4(0.0);\n" +
         "    for (int k = -2; k <= 2; k++)\n" +
         "    {\n" +
-        "        ivec2 o = (horizontal == 1) ? ivec2(clamp(g.x + k, 0, size.x - 1), g.y)\n" +
-        "                                    : ivec2(g.x, clamp(g.y + k, 0, size.y - 1));\n" +
-        "        acc += W[k + 2] * texelFetch(srcTex, ivec3(o, srcLayerBase + z), srcLod);\n" +
+        "        ivec2 p = (horizontal == 1) ? ivec2(g.x + k, g.y) : ivec2(g.x, g.y + k);\n" +
+        "        acc += W[k + 2] * tap(z, p);\n" +
         "    }\n" +
         "    imageStore(dst, ivec3(g, dstLayerBase + z), acc);\n" +
         "}\n";
@@ -131,9 +176,12 @@ public final class PointShadowEvsm
     private PointShadowEvsm()
     {}
 
+    /** The CUBE_MAP_ARRAY view — sampling crosses face edges seamlessly in hardware
+     *  (the 2D-array fetch needed manual clamp margins that plateaued into visible
+     *  ±45° bands at coarse mips). Compute passes keep writing the 2D-array storage. */
     public static int getGlTextureId()
     {
-        return texId;
+        return viewId;
     }
 
     /** radius = the light's far plane, needed to linearize depth before the warp. */
@@ -339,6 +387,18 @@ public final class PointShadowEvsm
         GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL12.GL_TEXTURE_MAX_LEVEL, 0);
 
         GL11.glBindTexture(GL30.GL_TEXTURE_2D_ARRAY, prevArr);
+
+        // cube view over the same storage (immutable glTexStorage3D, 96 = 16*6 layers): the
+        // pack samples THIS id — seamless cubemap filtering handles face edges at every mip
+        int prevCubeArr = GL11.glGetInteger(GL40.GL_TEXTURE_BINDING_CUBE_MAP_ARRAY);
+        viewId = GL11.glGenTextures();
+        GL43.glTextureView(viewId, GL40.GL_TEXTURE_CUBE_MAP_ARRAY, texId, GL30.GL_RGBA32F, 0, levels, 0, PointShadowArray.LAYER_COUNT);
+        GL11.glBindTexture(GL40.GL_TEXTURE_CUBE_MAP_ARRAY, viewId);
+        GL11.glTexParameteri(GL40.GL_TEXTURE_CUBE_MAP_ARRAY, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_LINEAR_MIPMAP_LINEAR);
+        GL11.glTexParameteri(GL40.GL_TEXTURE_CUBE_MAP_ARRAY, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_LINEAR);
+        GL11.glTexParameteri(GL40.GL_TEXTURE_CUBE_MAP_ARRAY, GL12.GL_TEXTURE_BASE_LEVEL, 0);
+        GL11.glTexParameteri(GL40.GL_TEXTURE_CUBE_MAP_ARRAY, GL12.GL_TEXTURE_MAX_LEVEL, levels - 1);
+        GL11.glBindTexture(GL40.GL_TEXTURE_CUBE_MAP_ARRAY, prevCubeArr);
     }
 
     private static int buildProgram(String src, String tag)
@@ -369,6 +429,11 @@ public final class PointShadowEvsm
      *  safe — 2D-array bindings are not tracked by GlStateManager. */
     public static void delete()
     {
+        if (viewId != 0)
+        {
+            GL11.glDeleteTextures(viewId);
+            viewId = 0;
+        }
         if (texId != 0)
         {
             GL11.glDeleteTextures(texId);
