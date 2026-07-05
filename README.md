@@ -4,11 +4,11 @@
 
 **The BBS-free shared engine behind IRLights & IRL-editor**
 
-*A plain-Java library — zero Minecraft, zero Loom — that holds the light SSBO pipeline and the `.irlights` shaderpack patcher. One Java&nbsp;17 jar serves every Minecraft version.*
+*A Fabric/Loom module (per-version MC-typed) that holds the light SSBO pipeline, shadow orchestration, and the `.irlights` shaderpack patcher. Built as Java&nbsp;17 for MC&nbsp;1.20.4; remapped to intermediary and bundled by both consumers (IRLights & IRL-editor).*
 
 [![Java](https://img.shields.io/badge/Java-17-f89820?style=flat-square&logo=openjdk&logoColor=white)](https://adoptium.net)
 [![License](https://img.shields.io/badge/License-MIT-3da639?style=flat-square)](LICENSE)
-[![Status](https://img.shields.io/badge/version-1.0--obt-blue?style=flat-square)](#)
+[![Status](https://img.shields.io/badge/built%20with-Loom%201.9-4060ff?style=flat-square)](#)
 
 </div>
 
@@ -21,7 +21,7 @@
 - **[IRLights](https://github.com/quaIett/bbs-irlights-addon)** — a BBS Mod Studio add-on
 - **[IRL-editor](https://github.com/quaIett/irl-editor)** — a standalone ImGui light editor
 
-It contains everything that has **no dependency on Minecraft or Fabric**: the GPU light buffer and the shaderpack patcher. Because it touches zero Minecraft types, a **single Java&nbsp;17 build** runs unchanged on every consumer (MC&nbsp;1.20.1 → 1.21.11, Java&nbsp;17 → 21).
+It bundles the GPU light buffer, shadow orchestration (MC-typed), and the shaderpack patcher. Built with Loom 1.9 (the oldest consumer's version; consumers reject newer Loom jars) and remapped to intermediary format. Because intermediary names are MC-version–specific, this artifact pairs exclusively with MC&nbsp;1.20.4 consumers; the name mappings are re-targeted by each mod's Loom at build time (addon uses `-Pmc=1.20.4`, editor uses native 1.20.4).
 
 ---
 
@@ -38,19 +38,23 @@ The patcher is **validate-first**: it aggregates every error before touching a f
 
 ## How it's consumed
 
-Both mods pull `irl-core` in via a **Gradle composite build**, then bundle it into their jar with Loom's `include` (JiJ):
+The core publishes a remapped (intermediary) jar to the local Maven repository. Each consumer builds it first:
+
+```bash
+./gradlew publishToMavenLocal
+```
+
+Then both mods pull `irl-core` from mavenLocal and bundle it into their jar with Loom's `include` (JiJ):
 
 ```groovy
-// settings.gradle (each mod)
-includeBuild("../irl-core")
-
 // build.gradle (each mod)
 dependencies {
-    include implementation("org.qualet:irl-core:1.0-obt")
+    modClientImplementation("org.qualet:irl-core:${irl_core_version}") // Loom remaps intermediary → named
+    include("org.qualet:irl-core:${irl_core_version}")
 }
 ```
 
-Environment-specific bindings (game directory, Iris API, "open folder") stay in each mod via a `PatcherHost` implementation — `irl-core` stays pure.
+The version is read from `gradle.properties` (currently `1.1`). Environment-specific bindings (game directory, Iris API, "open folder") stay in each mod via a `PatcherHost` implementation — `irl-core` stays pure.
 
 ---
 
@@ -58,10 +62,12 @@ Environment-specific bindings (game directory, Iris API, "open folder") stay in 
 
 ```bash
 ./gradlew build
-# output: build/libs/irl-core-1.0-obt.jar (+ sources jar)
+# output: build/libs/irl-core-1.1.jar (+ sources jar)
+./gradlew publishToMavenLocal
+# publishes remapped jar to ~/.m2/repository/org/qualet/irl-core/1.1/
 ```
 
-Requires a JDK 17+. The library compiles with `--release 17`; the resulting bytecode runs as-is on the Java&nbsp;21 runtime used by the 1.21.x ports.
+Requires a JDK 17+. Compiles with `--release 17`; the resulting (remapped) bytecode runs unchanged when consumers re-target it to their own named mappings (addon → 1.20.4 with Loom 1.15.5, editor → 1.20.4 with Loom 1.9).
 
 ---
 

@@ -40,6 +40,8 @@ final class PatchEngine
     final Map<String, FileState> files = new LinkedHashMap<>();
     final List<String> errors = new ArrayList<>();
     final List<String> infos = new ArrayList<>();
+    /** The {@link PatchResult.Outcome} of the FIRST error added to {@link #errors}, if any. */
+    PatchResult.Outcome firstErrorOutcome;
     int applied;
     int skipped;
 
@@ -51,13 +53,23 @@ final class PatchEngine
         return this.errors.isEmpty();
     }
 
+    private void addError(PatchResult.Outcome outcome, String message)
+    {
+        if (this.errors.isEmpty())
+        {
+            this.firstErrorOutcome = outcome;
+        }
+        this.errors.add(message);
+    }
+
     static PatchEngine run(Path root, IrlPatch patch)
     {
         PatchEngine engine = new PatchEngine();
 
         if (Files.exists(root.resolve(MARKER_FILE)))
         {
-            engine.errors.add("pack is already patched (" + MARKER_FILE + " present) — patch a clean copy instead");
+            engine.addError(PatchResult.Outcome.ALREADY_PATCHED,
+                "pack is already patched (" + MARKER_FILE + " present) — patch a clean copy instead");
             return engine;
         }
 
@@ -75,7 +87,8 @@ final class PatchEngine
         {
             if (this.files.containsKey(op.file) || Files.exists(root.resolve(op.file)))
             {
-                this.errors.add("+file target already exists in pack: " + op.file + " (pack already patched?)");
+                addError(PatchResult.Outcome.ADD_FILE_EXISTS,
+                    "+file target already exists in pack: " + op.file + " (pack already patched?)");
                 return;
             }
 
@@ -95,7 +108,7 @@ final class PatchEngine
             Path target = root.resolve(op.file);
             if (!Files.isRegularFile(target))
             {
-                this.errors.add("target file not found in pack: " + op.file);
+                addError(PatchResult.Outcome.TARGET_NOT_FOUND, "target file not found in pack: " + op.file);
                 return;
             }
 
@@ -106,7 +119,7 @@ final class PatchEngine
             }
             catch (IOException e)
             {
-                this.errors.add("cannot read " + op.file + ": " + e.getMessage());
+                addError(PatchResult.Outcome.READ_ERROR, "cannot read " + op.file + ": " + e.getMessage());
                 return;
             }
             state.eol = detectEol(state.content);
@@ -139,7 +152,8 @@ final class PatchEngine
         {
             if (ambiguous != null)
             {
-                this.errors.add("anchor is ambiguous (" + ambiguousCount + " matches) in " + op.file + ": \"" + preview(ambiguous) + "\"");
+                addError(PatchResult.Outcome.ANCHOR_AMBIGUOUS,
+                    "anchor is ambiguous (" + ambiguousCount + " matches) in " + op.file + ": \"" + preview(ambiguous) + "\"");
             }
             else if (op.optional)
             {
@@ -148,7 +162,7 @@ final class PatchEngine
             }
             else
             {
-                this.errors.add("anchor not found in " + op.file + ": " + previews(op.anchors));
+                addError(PatchResult.Outcome.ANCHOR_NOT_FOUND, "anchor not found in " + op.file + ": " + previews(op.anchors));
             }
             return;
         }

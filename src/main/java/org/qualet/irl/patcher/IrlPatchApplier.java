@@ -44,17 +44,18 @@ public final class IrlPatchApplier
             report(engine, result);
             if (engine.ok())
             {
+                result.outcome = PatchResult.Outcome.OK;
                 result.summary = "Patch fits " + sourcePack.getFileName() + ": " + opCount(engine);
                 result.info(result.summary);
             }
         }
         catch (PatchException e)
         {
-            result.fail(e.getMessage());
+            result.fail(PatchResult.Outcome.BAD_SOURCE, e.getMessage());
         }
         catch (IOException e)
         {
-            result.fail("IO error: " + e.getMessage());
+            result.fail(PatchResult.Outcome.IO_ERROR, "IO error: " + e.getMessage());
         }
         return result;
     }
@@ -102,21 +103,22 @@ public final class IrlPatchApplier
             }
             catch (IOException e)
             {
-                result.fail("IO error: " + e.getMessage());
+                result.fail(PatchResult.Outcome.IO_ERROR, "IO error: " + e.getMessage());
                 tryCleanup(outputPack, result);
                 return result;
             }
 
+            result.outcome = PatchResult.Outcome.OK;
             result.summary = "Patched OK -> " + outputPack.getFileName() + " (" + opCount(engine) + ")";
             result.info(result.summary);
         }
         catch (PatchException e)
         {
-            result.fail(e.getMessage());
+            result.fail(PatchResult.Outcome.BAD_SOURCE, e.getMessage());
         }
         catch (IOException e)
         {
-            result.fail("IO error: " + e.getMessage());
+            result.fail(PatchResult.Outcome.IO_ERROR, "IO error: " + e.getMessage());
         }
         return result;
     }
@@ -200,7 +202,7 @@ public final class IrlPatchApplier
     {
         if (patch.irliteVersion != 0 && patch.irliteVersion != IrlPatch.CONTRACT_VERSION)
         {
-            result.fail("patch requires GLSL contract v" + patch.irliteVersion
+            result.fail(PatchResult.Outcome.CONTRACT_MISMATCH, "patch requires GLSL contract v" + patch.irliteVersion
                 + ", this build provides v" + IrlPatch.CONTRACT_VERSION
                 + " — update the " + (patch.irliteVersion < IrlPatch.CONTRACT_VERSION ? "patch" : "mod"));
             return false;
@@ -218,7 +220,7 @@ public final class IrlPatchApplier
         if (!engine.ok())
         {
             List<String> errors = engine.errors;
-            result.fail(errors.size() == 1
+            result.fail(engine.firstErrorOutcome, errors.size() == 1
                 ? errors.get(0)
                 : errors.size() + " errors, first: " + errors.get(0));
             for (int i = 1; i < errors.size(); i++)

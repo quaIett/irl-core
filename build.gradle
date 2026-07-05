@@ -16,7 +16,7 @@ plugins {
 }
 
 group = 'org.qualet'
-version = '1.1'
+version = project.irl_core_version
 
 base {
     archivesName = 'irl-core'
@@ -37,6 +37,18 @@ tasks.withType(JavaCompile).configureEach {
 
 repositories {
     // Loom registers the Mojang + FabricMC mavens itself; only extra coords go here.
+    // Modrinth maven serves the Iris artifact (compile-only; see dependencies).
+    exclusiveContent {
+        forRepository {
+            maven {
+                name = "Modrinth"
+                url = "https://api.modrinth.com/maven"
+            }
+        }
+        filter {
+            includeGroup "maven.modrinth"
+        }
+    }
     mavenCentral()
 }
 
@@ -50,6 +62,13 @@ dependencies {
     // slf4j: the light/patcher loggers. Bundled by Fabric Loader at runtime, so
     // compileOnly (not bundled into the core jar).
     compileOnly 'org.slf4j:slf4j-api:2.0.9'
+
+    // Iris: the org.qualet.irl.light.iris package reads the pipeline state and
+    // binds samplers against Iris internals. Compile-only — NOT include/implementation:
+    // each consumer mod already brings its own Iris, and the core jar must not bundle
+    // or hard-depend on it. Same 1.20.4 artifact the addon uses
+    // (bbs-irlights-addon/build.gradle, -Pmc=1.20.4).
+    modCompileOnly "maven.modrinth:iris:1.7.2+1.20.4"
 }
 
 // Bake the Gradle version into the bundled fabric.mod.json. This jar carries its own
