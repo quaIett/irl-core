@@ -1,17 +1,18 @@
 package org.qualet.irl.light.shadow;
 
+import com.mojang.blaze3d.systems.ProjectionType;
 import com.mojang.blaze3d.systems.RenderSystem;
-import com.mojang.blaze3d.systems.VertexSorter;
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongSet;
 import it.unimi.dsi.fastutil.objects.ObjectIterator;
 import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gl.GlUsage;
+import net.minecraft.client.gl.ShaderProgramKeys;
 import net.minecraft.client.gl.VertexBuffer;
 import net.minecraft.client.render.BufferBuilder;
 import net.minecraft.client.render.BuiltBuffer;
-import net.minecraft.client.render.GameRenderer;
 import net.minecraft.client.render.RenderLayer;
 import net.minecraft.client.render.RenderLayers;
 import net.minecraft.client.render.Tessellator;
@@ -59,7 +60,7 @@ public final class ShadowRenderer
     private static boolean savedScissorEnabled;
     private static final int[] savedScissorBox = new int[4];
     private static Matrix4f savedProj;
-    private static VertexSorter savedSorter;
+    private static ProjectionType savedProjectionType;
     private static boolean savedMaskR, savedMaskG, savedMaskB, savedMaskA;
 
     private static final Matrix4f currentView = new Matrix4f();
@@ -331,13 +332,12 @@ public final class ShadowRenderer
      *  hardening for forms that self-draw against the live modelview at emit time). */
     static void establishLightMatrices(Matrix4f view, Matrix4f proj)
     {
-        RenderSystem.setProjectionMatrix(proj, VertexSorter.BY_DISTANCE);
-        // 1.21: getModelViewStack() returns a JOML Matrix4fStack (loadIdentity ->
-        // identity, multiplyPositionMatrix -> mul); applyModelViewMatrix still uploads it.
+        RenderSystem.setProjectionMatrix(proj, ProjectionType.PERSPECTIVE);
+        // 1.21.4: getModelViewStack() returns a JOML Matrix4fStack mutated in place;
+        // applyModelViewMatrix() was removed — the live stack IS the modelview now.
         Matrix4fStack mv = RenderSystem.getModelViewStack();
         mv.identity();
         mv.mul(view);
-        RenderSystem.applyModelViewMatrix();
     }
 
     // --- Block-shadow batch draw (non-full-shape blocks within an active pass) ---
@@ -425,7 +425,7 @@ public final class ShadowRenderer
             RenderSystem.depthMask(true);
             RenderSystem.enableDepthTest();
             RenderSystem.disableBlend();
-            RenderSystem.setShader(GameRenderer::getPositionProgram);
+            RenderSystem.setShader(ShaderProgramKeys.POSITION);
 
             // Rebuild only when the list instance changed (BlockShadowCache
             // returns the same instance on a hit) — static lamps just redraw.
@@ -498,7 +498,7 @@ public final class ShadowRenderer
             entry.shape.forEachBox(consumer);
         }
 
-        VertexBuffer vb = new VertexBuffer(VertexBuffer.Usage.STATIC);
+        VertexBuffer vb = new VertexBuffer(GlUsage.STATIC_WRITE);
         vb.bind();
         vb.upload(buf.end());
         VertexBuffer.unbind();
@@ -725,7 +725,7 @@ public final class ShadowRenderer
         {
             return null; // nothing emitted for this layer
         }
-        VertexBuffer vb = new VertexBuffer(VertexBuffer.Usage.STATIC);
+        VertexBuffer vb = new VertexBuffer(GlUsage.STATIC_WRITE);
         vb.bind();
         vb.upload(built);
         VertexBuffer.unbind();
@@ -836,8 +836,7 @@ public final class ShadowRenderer
 
         Matrix4fStack mvStack = RenderSystem.getModelViewStack();
         mvStack.popMatrix();
-        RenderSystem.applyModelViewMatrix();
-        RenderSystem.setProjectionMatrix(savedProj, savedSorter);
+        RenderSystem.setProjectionMatrix(savedProj, savedProjectionType);
 
         GL11.glColorMask(savedMaskR, savedMaskG, savedMaskB, savedMaskA);
 
@@ -876,7 +875,7 @@ public final class ShadowRenderer
             GL11.glGetIntegerv(GL11.GL_SCISSOR_BOX, savedScissorBox);
         }
         savedProj = RenderSystem.getProjectionMatrix();
-        savedSorter = RenderSystem.getVertexSorting();
+        savedProjectionType = RenderSystem.getProjectionType();
 
         try (org.lwjgl.system.MemoryStack stack = org.lwjgl.system.MemoryStack.stackPush())
         {
@@ -895,14 +894,13 @@ public final class ShadowRenderer
     {
         GL11.glColorMask(true, true, true, true);
 
-        RenderSystem.setProjectionMatrix(proj, VertexSorter.BY_DISTANCE);
+        RenderSystem.setProjectionMatrix(proj, ProjectionType.PERSPECTIVE);
         currentProj.set(proj);
 
         Matrix4fStack mvStack = RenderSystem.getModelViewStack();
         mvStack.pushMatrix();
         mvStack.identity();
         mvStack.mul(currentView);
-        RenderSystem.applyModelViewMatrix();
     }
 
     private static Vector3f pickStableUp(float dy)

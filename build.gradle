@@ -1,13 +1,13 @@
 // irl-core — the BBS-free shared engine for IRLite and IRL-redactor.
-// Per-version Fabric/Loom module (this branch = MC 1.21.1 line): the light
+// Per-version Fabric/Loom module (this branch = MC 1.21.4 line): the light
 // SSBO + registry, the .irlights shader patcher, AND the MC-typed shadow orchestration
 // (moved out of both mods in Ф2 of plan-irl-core-shadow-extraction).
 //
-// Built with Loom 1.15.5 — the consumers on the 1.21.1 line (addon + redactor) both run
+// Built with Loom 1.15.5 — the consumers on the 1.21.4 line (addon + redactor) both run
 // Loom 1.15. Published as a remapped (intermediary) jar to mavenLocal; each mod consumes
 // it with modClientImplementation (remap intermediary -> named) + include (JiJ).
-// intermediary names are MC-version specific, so this artifact pairs with MC 1.21.1
-// consumers only (addon -> -Pmc=1.21.1).
+// intermediary names are MC-version specific, so this artifact pairs with MC 1.21.4
+// consumers only (addon -> -Pmc=1.21.4).
 plugins {
     id 'fabric-loom' version '1.15.5'
     id 'maven-publish'
@@ -21,7 +21,7 @@ base {
 }
 
 java {
-    // On the 1.21.1 line both consumers run Java 21, so target Java 21.
+    // On the 1.21.4 line both consumers run Java 21, so target Java 21.
     sourceCompatibility = JavaVersion.VERSION_21
     targetCompatibility = JavaVersion.VERSION_21
     withSourcesJar()
@@ -50,10 +50,10 @@ repositories {
 }
 
 dependencies {
-    // MC 1.21.1 line. mappings (yarn) let the shadow orchestration compile
+    // MC 1.21.4 line. mappings (yarn) let the shadow orchestration compile
     // against named Minecraft; Loom remaps the published jar back to intermediary.
-    minecraft "com.mojang:minecraft:1.21.1"
-    mappings "net.fabricmc:yarn:1.21.1+build.3:v2"
+    minecraft "com.mojang:minecraft:1.21.4"
+    mappings "net.fabricmc:yarn:1.21.4+build.8:v2"
     modImplementation "net.fabricmc:fabric-loader:0.16.14"
 
     // slf4j: the light/patcher loggers. Bundled by Fabric Loader at runtime, so
@@ -63,10 +63,10 @@ dependencies {
     // Iris: the org.qualet.irl.light.iris package reads the pipeline state and
     // binds samplers against Iris internals. Compile-only — NOT include/implementation:
     // each consumer mod already brings its own Iris, and the core jar must not bundle
-    // or hard-depend on it. Same 1.21.1 artifact the addon uses
-    // (bbs-irlights-addon/build.gradle, -Pmc=1.21.1). 1.8.8 keeps the 2-arg
+    // or hard-depend on it. Same 1.21.4 artifact the addon uses
+    // (bbs-irlights-addon/build.gradle, -Pmc=1.21.4). 1.8.8 keeps the 2-arg
     // addDynamicSampler the sampler binding relies on.
-    modCompileOnly "maven.modrinth:iris:1.8.8+1.21.1-fabric"
+    modCompileOnly "maven.modrinth:iris:1.8.8+1.21.4-fabric"
 }
 
 // Bake the Gradle version into the bundled fabric.mod.json. This jar carries its own

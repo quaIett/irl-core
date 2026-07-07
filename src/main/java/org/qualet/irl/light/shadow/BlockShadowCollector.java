@@ -120,7 +120,7 @@ public final class BlockShadowCollector
                     VoxelShape shape;
                     try
                     {
-                        shape = state.getCullingShape(world, mut);
+                        shape = state.getCullingShape();
                         if (shape == null || shape.isEmpty())
                         {
                             shape = state.getCollisionShape(world, mut);
