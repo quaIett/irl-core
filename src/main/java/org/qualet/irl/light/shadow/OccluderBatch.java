@@ -5,8 +5,9 @@ import org.joml.Matrix4f;
 /**
  * Opaque per-pass batch handle a {@link ShadowCasterSource#emitOccluder} emits
  * geometry into. The source downcasts to its known backend (here
- * {@link ImmediateOccluderBatch} for the vanilla entity Immediate; a raw depth-VBO
- * accumulator on the 1.21.11 port) — the orchestration never inspects it.
+ * {@link RawOccluderBatch}, the raw depth-VBO accumulator of the 1.21.11 line;
+ * pre-1.21.5 lines use an Immediate-based batch) — the orchestration never
+ * inspects it.
  *
  * <p>The two hooks below are SHARED-owned (the wrapper around emitOccluder calls
  * them); a source never calls them. They exist so the shared layer can enforce

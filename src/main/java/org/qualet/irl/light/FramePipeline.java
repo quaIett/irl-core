@@ -79,7 +79,7 @@ public final class FramePipeline
         MinecraftClient mc = MinecraftClient.getInstance();
         ClientWorld world = mc.world;
         Camera camera = mc.gameRenderer.getCamera();
-        Vec3d cameraPos = camera != null ? camera.getPos() : Vec3d.ZERO;
+        Vec3d cameraPos = camera != null ? camera.getCameraPos() : Vec3d.ZERO;
         // Forward look vector for the shadow baker's behind-camera light cull.
         Vec3d cameraForward = camera != null ? Vec3d.fromPolar(camera.getPitch(), camera.getYaw()) : null;
 
@@ -90,7 +90,11 @@ public final class FramePipeline
         // rendering writes into our depth FBO).
         if (world != null && camera != null)
         {
-            mc.getEntityRenderDispatcher().configure(world, camera, mc.getCameraEntity());
+            // 1.21.11: EntityRenderDispatcher was renamed to EntityRenderManager and
+            // configure() dropped its world parameter -> configure(Camera, Entity).
+            // MinecraftClient.getEntityRenderDispatcher() kept its name but now returns
+            // the renamed EntityRenderManager.
+            mc.getEntityRenderDispatcher().configure(camera, mc.getCameraEntity());
         }
         ShadowBaker.bake(world, cameraPos, cameraForward, tickDelta);
 

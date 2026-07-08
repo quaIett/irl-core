@@ -2,8 +2,8 @@ package org.qualet.irl.light.shadow;
 
 import net.minecraft.block.BlockRenderType;
 import net.minecraft.block.BlockState;
-import net.minecraft.client.render.RenderLayer;
-import net.minecraft.client.render.RenderLayers;
+import net.minecraft.client.render.BlockRenderLayer;
+import net.minecraft.client.render.BlockRenderLayers;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.shape.VoxelShape;
@@ -101,11 +101,17 @@ public final class BlockShadowCollector
                     // via vanilla's alpha-test cutout shader so transparent
                     // texture pixels let light through. Shape is unused for
                     // these - geometry comes from the model, not the AABB.
+                    // Classification mirrors 1.21.4's RenderLayers.getBlockLayer; on
+                    // 1.21.11 that API was renamed + retyped to
+                    // BlockRenderLayers.getBlockLayer -> BlockRenderLayer enum
+                    // {SOLID, CUTOUT, TRANSLUCENT, TRIPWIRE}. The old distinct
+                    // getCutout()/getCutoutMipped() RenderLayers collapse into a single
+                    // BlockRenderLayer.CUTOUT (there is no mipped variant in the enum).
                     boolean cutout;
                     try
                     {
-                        RenderLayer layer = RenderLayers.getBlockLayer(state);
-                        cutout = layer == RenderLayer.getCutout() || layer == RenderLayer.getCutoutMipped();
+                        BlockRenderLayer layer = BlockRenderLayers.getBlockLayer(state);
+                        cutout = layer == BlockRenderLayer.CUTOUT;
                     }
                     catch (Throwable t)
                     {

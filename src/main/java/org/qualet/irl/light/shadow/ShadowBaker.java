@@ -882,6 +882,10 @@ public final class ShadowBaker
         liveIds.clear();
         BlockShadowCache.retainOnly(liveIds);
         ShadowRenderer.retainBlockVbos(liveIds);
+        // 1.21.11 raw-GL line: also free the caster path's off-heap upload buffer +
+        // its VBO (both re-create lazily on the next bake). The 1.21.4 line had no
+        // such native resource — the caster draw rode MC's Immediate.
+        ShadowRenderer.releaseScratch();
         SpotlightDepthAtlas.delete();
         PointShadowArray.delete();
     }

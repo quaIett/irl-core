@@ -2,6 +2,7 @@ package org.qualet.irl.light.iris;
 
 import net.irisshaders.iris.gl.IrisRenderSystem;
 import net.irisshaders.iris.gl.program.ProgramSamplers;
+import net.irisshaders.iris.gl.texture.TextureType;
 import org.lwjgl.opengl.GL11;
 
 import org.qualet.irl.light.IrlSamplers;
@@ -28,7 +29,15 @@ public final class IrlSamplersBind
      */
     public static void bindAll(ProgramSamplers.Builder builder)
     {
-        IrlSamplers.forEach((name, glId, glTarget) -> builder.addDynamicSampler(glId, name));
+        // Iris 1.10.7 dropped the 2-arg addDynamicSampler(IntSupplier, String); the
+        // surviving typed overload is
+        // addDynamicSampler(TextureType, IntSupplier, Supplier<GlSampler>, String...).
+        // Every IRLite sampler is registered as a plain TEXTURE_2D (TextureType has no
+        // CUBE_MAP_ARRAY / 2D_ARRAY); the array-backed ones are rebound to their real
+        // GL target on bind time by the per-mod SamplerBinding mixin (see tryRebind).
+        // The Supplier<GlSampler> is () -> null so Iris uses the program's default sampler.
+        IrlSamplers.forEach((name, glId, glTarget) ->
+            builder.addDynamicSampler(TextureType.TEXTURE_2D, glId, () -> null, name));
     }
 
     /**
