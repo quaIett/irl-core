@@ -163,8 +163,28 @@ public final class LightRegistry
         count = 0;
     }
 
-    /** Pack the accumulated set into the GPU buffer and reset for the next frame. */
+    /** Pack the accumulated set into the GPU buffer (absolute world positions) and
+     *  reset for the next frame. Kept for ABI compatibility — delegates to the
+     *  camera-relative flush with a zero origin (= absolute). */
     public static void flush()
+    {
+        flush(0.0, 0.0, 0.0);
+    }
+
+    /** Pack the accumulated set into the GPU buffer with positions made RELATIVE to
+     *  {@code origin} (the camera/eye), then reset for the next frame.
+     *
+     *  <p>Light positions are collected in absolute world coordinates (kept absolute in
+     *  this registry so the shadow baker can query world blocks), but the SSBO — and the
+     *  shader that reads it — must work in camera-relative space: at large world
+     *  coordinates the absolute float positions and the shaderpack's reconstructed
+     *  fragment position lose precision against each other and the light visibly stops
+     *  lighting. Subtracting the camera origin here (and dropping the matching
+     *  {@code + cameraPosition} reconstruction in the GLSL patches) keeps both sides of
+     *  the {@code light.pos - fragPos} comparison small and precise. The subtraction is
+     *  done in double so it stays exact regardless of distance from origin. Directions
+     *  (spot) are NOT translated.</p> */
+    public static void flush(double originX, double originY, double originZ)
     {
         LightBuffer.begin();
 
@@ -174,13 +194,17 @@ public final class LightRegistry
             // entities-only wins the (UI-prevented) both-set case.
             float lightMask = entitiesOnly[i] ? 1F : (blocksOnly[i] ? 2F : 0F);
 
+            float rx = (float) ((double) px[i] - originX);
+            float ry = (float) ((double) py[i] - originY);
+            float rz = (float) ((double) pz[i] - originZ);
+
             if (type[i] == 0)
             {
-                LightBuffer.addPoint(px[i], py[i], pz[i], cr[i], cg[i], cb[i], intensity[i], radius[i], lightMask, anisotropy[i], density[i], beam[i], (float) shadowTile[i], bulbSize[i]);
+                LightBuffer.addPoint(rx, ry, rz, cr[i], cg[i], cb[i], intensity[i], radius[i], lightMask, anisotropy[i], density[i], beam[i], (float) shadowTile[i], bulbSize[i]);
             }
             else
             {
-                LightBuffer.addSpot(px[i], py[i], pz[i], dx[i], dy[i], dz[i], cr[i], cg[i], cb[i], intensity[i], radius[i], cosOuter[i], cosInner[i], lightMask, anisotropy[i], density[i], beam[i], (float) shadowTile[i], bulbSize[i], cookieLayer[i], cookieRot[i], cookieScale[i], cookieFlags[i]);
+                LightBuffer.addSpot(rx, ry, rz, dx[i], dy[i], dz[i], cr[i], cg[i], cb[i], intensity[i], radius[i], cosOuter[i], cosInner[i], lightMask, anisotropy[i], density[i], beam[i], (float) shadowTile[i], bulbSize[i], cookieLayer[i], cookieRot[i], cookieScale[i], cookieFlags[i]);
             }
         }
 

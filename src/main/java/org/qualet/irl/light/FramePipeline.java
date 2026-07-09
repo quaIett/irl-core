@@ -98,6 +98,9 @@ public final class FramePipeline
         }
         ShadowBaker.bake(world, cameraPos, cameraForward, tickDelta);
 
-        LightRegistry.flush();
+        // Camera-relative SSBO upload: subtract the camera origin so light
+        // positions stay precise far from world origin (the .irlights patches
+        // drop the matching + cameraPosition reconstruction on the shader side).
+        LightRegistry.flush(cameraPos.x, cameraPos.y, cameraPos.z);
     }
 }
