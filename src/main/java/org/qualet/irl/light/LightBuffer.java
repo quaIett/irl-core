@@ -13,7 +13,7 @@ import java.nio.ByteBuffer;
  * std430 contract (the patcher's GLSL must mirror this exactly):
  *
  *   struct Light {
- *       vec4 posRadius;       // xyz = world position, w = radius
+ *       vec4 posRadius;       // xyz = position RELATIVE TO CAMERA (eye), w = radius
  *       vec4 colorIntensity;  // rgb = linear color, a = intensity
  *       vec4 dirType;         // xyz = direction (spot, normalized), w = type (0 point, 1 spot)
  *       vec4 cone;            // x = cos(outerAngle/2), y = cos(innerAngle/2), z = lightMask (0 all, 1 entities only, 2 blocks only), w = bulbSize (0 = use global)
