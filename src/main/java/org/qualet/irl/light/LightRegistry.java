@@ -16,9 +16,13 @@ public final class LightRegistry
     private static final int MAX = LightBuffer.MAX_LIGHTS;
 
     private static final int[] type = new int[MAX];
-    private static final float[] px = new float[MAX];
-    private static final float[] py = new float[MAX];
-    private static final float[] pz = new float[MAX];
+    // Absolute world positions, kept in DOUBLE so a light far from origin (e.g.
+    // X=100000) is not float-quantized before the camera-relative flush subtracts
+    // the eye. getX/Y/Z narrow to float for the shadow baker (translation-invariant,
+    // see flush); only the small post-subtraction residual is cast to float.
+    private static final double[] px = new double[MAX];
+    private static final double[] py = new double[MAX];
+    private static final double[] pz = new double[MAX];
     private static final float[] cr = new float[MAX];
     private static final float[] cg = new float[MAX];
     private static final float[] cb = new float[MAX];
@@ -49,7 +53,18 @@ public final class LightRegistry
     private LightRegistry()
     {}
 
+    /** Float-position overload (kept for ABI); widens to the double-position
+     *  {@code registerPoint} so the far-from-origin precision win is available to
+     *  callers that already narrowed. */
     public static void registerPoint(float x, float y, float z, float r, float g, float b, float in, float rad, boolean eOnly, boolean bOnly, float aniso, float dens, float bm, float bulb, boolean castsShadows, long identity)
+    {
+        registerPoint((double) x, (double) y, (double) z, r, g, b, in, rad, eOnly, bOnly, aniso, dens, bm, bulb, castsShadows, identity);
+    }
+
+    /** Register a point light at an absolute world position kept in DOUBLE, so a
+     *  light far from origin is not float-quantized before the camera-relative
+     *  {@link #flush(double, double, double)} subtracts the eye. */
+    public static void registerPoint(double x, double y, double z, float r, float g, float b, float in, float rad, boolean eOnly, boolean bOnly, float aniso, float dens, float bm, float bulb, boolean castsShadows, long identity)
     {
         int i = slot(identity);
         if (i < 0)
@@ -68,14 +83,30 @@ public final class LightRegistry
         bulbSize[i] = bulb; shadows[i] = castsShadows;
     }
 
-    /** No-cookie overload (the BBS addon's call path): delegates with the gobo
+    /** No-cookie float overload (the BBS addon's call path): delegates with the gobo
      *  disabled (layer -1). Keeps the addon ABI stable across the cookie struct bump. */
     public static void registerSpot(float x, float y, float z, float ndx, float ndy, float ndz, float r, float g, float b, float in, float range, float cosO, float cosI, boolean eOnly, boolean bOnly, float aniso, float dens, float bm, float bulb, boolean castsShadows, long identity)
     {
         registerSpot(x, y, z, ndx, ndy, ndz, r, g, b, in, range, cosO, cosI, eOnly, bOnly, aniso, dens, bm, bulb, castsShadows, -1F, 0F, 1F, 0F, identity);
     }
 
+    /** No-cookie double overload: same gobo-disabled delegation, keeping the absolute
+     *  position in double (render-path spot lights far from origin). */
+    public static void registerSpot(double x, double y, double z, float ndx, float ndy, float ndz, float r, float g, float b, float in, float range, float cosO, float cosI, boolean eOnly, boolean bOnly, float aniso, float dens, float bm, float bulb, boolean castsShadows, long identity)
+    {
+        registerSpot(x, y, z, ndx, ndy, ndz, r, g, b, in, range, cosO, cosI, eOnly, bOnly, aniso, dens, bm, bulb, castsShadows, -1F, 0F, 1F, 0F, identity);
+    }
+
+    /** Cookie float overload (kept for ABI); widens to the double-position cookie overload. */
     public static void registerSpot(float x, float y, float z, float ndx, float ndy, float ndz, float r, float g, float b, float in, float range, float cosO, float cosI, boolean eOnly, boolean bOnly, float aniso, float dens, float bm, float bulb, boolean castsShadows, float cLayer, float cRot, float cScale, float cFlags, long identity)
+    {
+        registerSpot((double) x, (double) y, (double) z, ndx, ndy, ndz, r, g, b, in, range, cosO, cosI, eOnly, bOnly, aniso, dens, bm, bulb, castsShadows, cLayer, cRot, cScale, cFlags, identity);
+    }
+
+    /** Register a spot light at an absolute world position kept in DOUBLE (see
+     *  {@link #registerPoint(double, double, double, float, float, float, float, float, boolean, boolean, float, float, float, float, boolean, long)}).
+     *  Directions are unit vectors and are NOT affected by the far-from-origin loss. */
+    public static void registerSpot(double x, double y, double z, float ndx, float ndy, float ndz, float r, float g, float b, float in, float range, float cosO, float cosI, boolean eOnly, boolean bOnly, float aniso, float dens, float bm, float bulb, boolean castsShadows, float cLayer, float cRot, float cScale, float cFlags, long identity)
     {
         int i = slot(identity);
         if (i < 0)
@@ -130,9 +161,13 @@ public final class LightRegistry
         return type[i];
     }
 
-    public static float getX(int i) { return px[i]; }
-    public static float getY(int i) { return py[i]; }
-    public static float getZ(int i) { return pz[i]; }
+    // Absolute positions narrowed to float for the shadow baker. The bake is
+    // distance/translation-invariant, so the far-from-origin residual is sub-block
+    // and irrelevant to the cull + block sampling (see the migration note); the
+    // camera-relative SSBO residual stays double-precise via flush().
+    public static float getX(int i) { return (float) px[i]; }
+    public static float getY(int i) { return (float) py[i]; }
+    public static float getZ(int i) { return (float) pz[i]; }
     public static float getDirX(int i) { return dx[i]; }
     public static float getDirY(int i) { return dy[i]; }
     public static float getDirZ(int i) { return dz[i]; }
@@ -174,16 +209,17 @@ public final class LightRegistry
     /** Pack the accumulated set into the GPU buffer with positions made RELATIVE to
      *  {@code origin} (the camera/eye), then reset for the next frame.
      *
-     *  <p>Light positions are collected in absolute world coordinates (kept absolute in
-     *  this registry so the shadow baker can query world blocks), but the SSBO — and the
-     *  shader that reads it — must work in camera-relative space: at large world
-     *  coordinates the absolute float positions and the shaderpack's reconstructed
-     *  fragment position lose precision against each other and the light visibly stops
-     *  lighting. Subtracting the camera origin here (and dropping the matching
-     *  {@code + cameraPosition} reconstruction in the GLSL patches) keeps both sides of
-     *  the {@code light.pos - fragPos} comparison small and precise. The subtraction is
-     *  done in double so it stays exact regardless of distance from origin. Directions
-     *  (spot) are NOT translated.</p> */
+     *  <p>Light positions are collected in absolute world coordinates (kept absolute — and
+     *  in {@code double}, see the {@code px/py/pz} fields — in this registry so the shadow
+     *  baker can query world blocks), but the SSBO — and the shader that reads it — must
+     *  work in camera-relative space: at large world coordinates the absolute position and
+     *  the shaderpack's reconstructed fragment position lose precision against each other
+     *  and the light visibly stops lighting. Subtracting the camera origin here (and
+     *  dropping the matching {@code + cameraPosition} reconstruction in the GLSL patches)
+     *  keeps both sides of the {@code light.pos - fragPos} comparison small and precise.
+     *  Both the stored position and the subtraction are done in double so the residual
+     *  stays exact regardless of distance from origin; only the small residual is cast to
+     *  float. Directions (spot) are NOT translated.</p> */
     public static void flush(double originX, double originY, double originZ)
     {
         LightBuffer.begin();
@@ -194,9 +230,9 @@ public final class LightRegistry
             // entities-only wins the (UI-prevented) both-set case.
             float lightMask = entitiesOnly[i] ? 1F : (blocksOnly[i] ? 2F : 0F);
 
-            float rx = (float) ((double) px[i] - originX);
-            float ry = (float) ((double) py[i] - originY);
-            float rz = (float) ((double) pz[i] - originZ);
+            float rx = (float) (px[i] - originX);
+            float ry = (float) (py[i] - originY);
+            float rz = (float) (pz[i] - originZ);
 
             if (type[i] == 0)
             {
