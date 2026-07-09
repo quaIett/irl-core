@@ -9,12 +9,16 @@ import org.qualet.irl.light.shadow.ShadowBaker;
 import java.util.function.BooleanSupplier;
 
 /**
- * The per-frame light orchestration run at renderWorld HEAD, before Iris
- * activates: collect this frame's lights, bake spotlight/point shadow maps, and
- * flush the light SSBO. Both IRLite and IRL-redactor drive this identically; the
- * per-mod {@code GameRendererLightMixin} is a thin delegate that supplies the
- * two mod-specific seams (the shaders-off check and the light collect source)
- * plus an optional dormant hook.
+ * The per-frame light orchestration. {@link #frame} runs at renderWorld HEAD,
+ * before Iris activates: collect this frame's lights and bake spotlight/point
+ * shadow maps. The camera-relative SSBO upload is split off into
+ * {@link #uploadIfPending}, which the mixin invokes just after this frame's
+ * {@code Camera.update} so the SSBO origin is the CURRENT-frame eye (uploading at
+ * HEAD would use the stale previous-frame camera and make lights jerk on movement).
+ * Both IRLite and IRL-redactor drive this identically; the per-mod
+ * {@code GameRendererLightMixin} is a thin delegate that supplies the two
+ * mod-specific seams (the shaders-off check and the light collect source), the
+ * optional dormant hook, and the post-Camera.update {@link #uploadIfPending} call.
  *
  * <h2>Shaders-off gate</h2>
  * With no shaderpack active nothing consumes the SSBO or the shadow maps, so the
@@ -40,6 +44,13 @@ public final class FramePipeline
      *  the transition into that state. */
     private static boolean dormant;
 
+    /** Set by {@link #frame} once this frame's lights are collected + baked, cleared
+     *  by {@link #uploadIfPending} once the deferred SSBO upload runs. It bridges the
+     *  two renderWorld injection points (HEAD collect/bake -> post-Camera.update upload)
+     *  and lets a skipped upload (renderWorld cancelled between them) be recovered on
+     *  the next frame instead of leaking a stale, half-collected registry. */
+    private static boolean flushPending;
+
     private FramePipeline()
     {}
 
@@ -62,6 +73,7 @@ public final class FramePipeline
         if (shadersDisabled.getAsBoolean())
         {
             LightRegistry.clear();
+            flushPending = false;
 
             if (!dormant)
             {
@@ -72,6 +84,18 @@ public final class FramePipeline
             }
 
             return;
+        }
+
+        // Self-consistency guard: if last frame's deferred upload never ran (renderWorld
+        // was cancelled between the HEAD collect and the post-Camera.update upload), its
+        // collected set was neither uploaded nor cleared. Drop it now so this frame starts
+        // clean instead of double-accumulating stale (departed-actor) lights. That frame's
+        // world render — and thus its render-path light registrations — was cancelled too,
+        // so nothing legitimate is lost.
+        if (flushPending)
+        {
+            LightRegistry.clear();
+            flushPending = false;
         }
 
         dormant = false;
@@ -94,9 +118,38 @@ public final class FramePipeline
         }
         ShadowBaker.bake(world, cameraPos, cameraForward, tickDelta);
 
-        // Camera-relative SSBO upload: subtract the camera origin so light
-        // positions stay precise far from world origin (the .irlights patches
-        // drop the matching + cameraPosition reconstruction on the shader side).
-        LightRegistry.flush(cameraPos.x, cameraPos.y, cameraPos.z);
+        // The camera-relative SSBO upload is DEFERRED to uploadIfPending(), invoked by
+        // the per-mod mixin just after this frame's Camera.update. Collect + bake stay
+        // here at renderWorld HEAD (before Iris activates), but the origin the SSBO is
+        // made relative to must be THIS frame's eye — which vanilla only computes later,
+        // in Camera.update. Uploading here would subtract the PREVIOUS frame's camera
+        // (getCamera() is not yet updated at HEAD) while the shaderpack reconstructs
+        // fragments against this frame's eye, so a moving camera would drag the light by
+        // one frame of motion (a visible jerk under frametime spikes). Marking pending
+        // hands the upload to the post-update injection.
+        flushPending = true;
+    }
+
+    /**
+     * Upload this frame's collected lights to the SSBO, made relative to the CURRENT
+     * frame's camera. Called from the per-mod {@code GameRendererLightMixin} at the
+     * point just after {@code Camera.update} inside renderWorld — after vanilla has
+     * positioned this frame's eye but before the world (and Iris) render, so the SSBO
+     * origin matches the very camera the shaderpack reconstructs fragment positions
+     * from and a camera-relative light no longer lags or jerks by a frame of camera
+     * motion. No-op unless {@link #frame} collected this frame.
+     */
+    public static void uploadIfPending()
+    {
+        if (!flushPending)
+        {
+            return;
+        }
+        flushPending = false;
+
+        MinecraftClient mc = MinecraftClient.getInstance();
+        Camera camera = mc.gameRenderer.getCamera();
+        Vec3d p = camera != null ? camera.getPos() : Vec3d.ZERO;
+        LightRegistry.flush(p.x, p.y, p.z);
     }
 }
