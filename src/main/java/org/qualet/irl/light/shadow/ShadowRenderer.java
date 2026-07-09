@@ -95,6 +95,19 @@ public final class ShadowRenderer
     private static final Matrix4f currentProj = new Matrix4f();
     private static final Matrix4f viewProj = new Matrix4f();
 
+    /** Per-pass light-relative bake anchor A = round((float) lightPos). The pass view
+     *  eye is L - A and EVERY caster vertex (opaque VBO, cutout VBO, entity accum)
+     *  enters as worldPos - A subtracted in DOUBLE before its float cast, so
+     *  viewProj*(v-A) with eye L-A == R*(v-L): A cancels exactly, the stored depth
+     *  contract is unchanged, the 1e5 float cancellation is removed. round((float)
+     *  lightPos) == BlockShadowCache's block snap == round(getX), so this shared
+     *  anchor stays in lockstep with the per-light cached block/cutout VBO. Exposed so
+     *  the mods' entity arm (editor OccluderGeometryCapturer) subtracts the SAME A. */
+    private static double currentOriginX, currentOriginY, currentOriginZ;
+    public static double currentOriginX() { return currentOriginX; }
+    public static double currentOriginY() { return currentOriginY; }
+    public static double currentOriginZ() { return currentOriginZ; }
+
     // --- Reused matrix scratch (T1.3) ----------------------------------------
     // The spot projection depends only on (fov, far) and the point projection only
     // on far, but a bake runs many passes (every spot tile, every point face) —
@@ -135,12 +148,22 @@ public final class ShadowRenderer
      * static base just restored by {@link SpotlightDepthAtlas#copyStaticToLive}.
      */
     public static void beginSpot(int tile,
-                                 float lpx, float lpy, float lpz,
+                                 double lpx, double lpy, double lpz,
                                  float ldx, float ldy, float ldz,
                                  float range, float outerDeg,
                                  boolean toStatic, boolean clear)
     {
         savePassState();
+
+        // Light-relative bake anchor A = round((float) lightPos) (== BlockShadowCache's
+        // block snap), and the pass view eye at L - A carried in float (the sub-block
+        // residual). ldx/ldy/ldz stay float — direction is translation-invariant.
+        currentOriginX = Math.round((float) lpx);
+        currentOriginY = Math.round((float) lpy);
+        currentOriginZ = Math.round((float) lpz);
+        float ex = (float) (lpx - currentOriginX);
+        float ey = (float) (lpy - currentOriginY);
+        float ez = (float) (lpz - currentOriginZ);
 
         GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, SpotlightDepthAtlas.getFboId(toStatic));
         int px = SpotlightDepthAtlas.tilePixelX(tile);
@@ -168,8 +191,8 @@ public final class ShadowRenderer
 
         Vector3f up = pickStableUp(ldy);
         currentView.identity().lookAt(
-            lpx, lpy, lpz,
-            lpx + ldx, lpy + ldy, lpz + ldz,
+            ex, ey, ez,
+            ex + ldx, ey + ldy, ez + ldz,
             up.x, up.y, up.z
         );
     }
@@ -181,11 +204,21 @@ public final class ShadowRenderer
      * {@link PointShadowArray#copyStaticToLive}).
      */
     public static void beginPointFace(int slot, int face,
-                                      float lpx, float lpy, float lpz,
+                                      double lpx, double lpy, double lpz,
                                       float radius,
                                       boolean toStatic, boolean clear)
     {
         savePassState();
+
+        // Light-relative bake anchor A = round((float) lightPos) (== BlockShadowCache's
+        // block snap), and the pass view eye at L - A carried in float (the sub-block
+        // residual). The face dx/dy/dz below stay unit floats — translation-invariant.
+        currentOriginX = Math.round((float) lpx);
+        currentOriginY = Math.round((float) lpy);
+        currentOriginZ = Math.round((float) lpz);
+        float ex = (float) (lpx - currentOriginX);
+        float ey = (float) (lpy - currentOriginY);
+        float ez = (float) (lpz - currentOriginZ);
 
         PointShadowArray.bindFaceForRender(slot, face, toStatic);
         int fs = PointShadowArray.FACE_SIZE;
@@ -219,8 +252,8 @@ public final class ShadowRenderer
         }
 
         currentView.identity().lookAt(
-            lpx, lpy, lpz,
-            lpx + dx, lpy + dy, lpz + dz,
+            ex, ey, ez,
+            ex + dx, ey + dy, ez + dz,
             ux, uy, uz
         );
     }
@@ -598,11 +631,17 @@ public final class ShadowRenderer
                 {
                     continue;
                 }
-                final float ox = e.pos.getX(), oy = e.pos.getY(), oz = e.pos.getZ();
+                // worldPos - A subtracted in DOUBLE before the float cast: (int pos) -
+                // (integral double A) + (double shape) -> float is exact, and the cache
+                // bakes A in — the block-list instance changes exactly when the snap/A
+                // changes (line 493 gate), so a cached VBO's A always equals the pass
+                // eye's A. Mirrors main QuadBoxConsumer x1 = (float)(ox - originX + minX).
+                final int ox = e.pos.getX(), oy = e.pos.getY(), oz = e.pos.getZ();
+                final double ax = currentOriginX, ay = currentOriginY, az = currentOriginZ;
                 e.shape.forEachBox((minX, minY, minZ, maxX, maxY, maxZ) ->
                     emitBox(fb,
-                        ox + (float) minX, oy + (float) minY, oz + (float) minZ,
-                        ox + (float) maxX, oy + (float) maxY, oz + (float) maxZ));
+                        (float) (ox - ax + minX), (float) (oy - ay + minY), (float) (oz - az + minZ),
+                        (float) (ox - ax + maxX), (float) (oy - ay + maxY), (float) (oz - az + maxZ)));
             }
             fb.flip();
 
@@ -892,9 +931,11 @@ public final class ShadowRenderer
             }
 
             MatrixStack ms = new MatrixStack();
-            // Pre-translate to the absolute block origin: the block renderer only
-            // applies the block's model offset, never its world position.
-            ms.translate(pos.getX(), pos.getY(), pos.getZ());
+            // Pre-translate to the anchor-relative block origin (world - A): the block
+            // renderer only applies the block's model offset, never its world position.
+            // (int pos) - (double anchor A) -> MatrixStack.translate(double), narrowed
+            // to float inside MC. Same list-instance cache lockstep as the opaque path.
+            ms.translate(pos.getX() - currentOriginX, pos.getY() - currentOriginY, pos.getZ() - currentOriginZ);
 
             CUTOUT_CAPTURE.reset();
             brm.renderBlock(state, pos, world, ms, CUTOUT_CAPTURE, true, parts);

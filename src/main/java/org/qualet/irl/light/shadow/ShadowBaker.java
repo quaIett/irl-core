@@ -282,6 +282,11 @@ public final class ShadowBaker
             float lx = LightRegistry.getX(i);
             float ly = LightRegistry.getY(i);
             float lz = LightRegistry.getZ(i);
+            // DOUBLE light position feeds the light-relative bake anchor + view eye
+            // (ShadowRenderer derives A = round((float) lxD) == round(lx), eye = L-A).
+            // The float lx/ly/lz stay the cull / block-cache / signature ABI; by
+            // construction (float) lxD == lx, so the anchor stays locked to the snap.
+            double lxD = LightRegistry.getXd(i), lyD = LightRegistry.getYd(i), lzD = LightRegistry.getZd(i);
             float range = LightRegistry.getRange(i);
             if (range < 1e-3f)
             {
@@ -349,7 +354,7 @@ public final class ShadowBaker
                 {
                     profSpotBakes++;
                 }
-                ShadowRenderer.beginSpot(myTile, lx, ly, lz, dx, dy, dz, range, outerDeg, false, true);
+                ShadowRenderer.beginSpot(myTile, lxD, lyD, lzD, dx, dy, dz, range, outerDeg, false, true);
                 if (entInRange > 0)
                 {
                     renderInRangeCone(CASTERS_ALL, tickDelta);
@@ -385,7 +390,7 @@ public final class ShadowBaker
                         {
                             profSpotBakes++;
                         }
-                        ShadowRenderer.beginSpot(myTile, lx, ly, lz, dx, dy, dz, range, outerDeg, false, true);
+                        ShadowRenderer.beginSpot(myTile, lxD, lyD, lzD, dx, dy, dz, range, outerDeg, false, true);
                         if (staticInRangeScratch > 0)
                         {
                             renderInRangeCone(CASTERS_STATIC, tickDelta);
@@ -437,7 +442,7 @@ public final class ShadowBaker
                     {
                         profSpotBakes++;
                     }
-                    ShadowRenderer.beginSpot(myTile, lx, ly, lz, dx, dy, dz, range, outerDeg, true, true);
+                    ShadowRenderer.beginSpot(myTile, lxD, lyD, lzD, dx, dy, dz, range, outerDeg, true, true);
                     if (staticInRangeScratch > 0)
                     {
                         renderInRangeCone(CASTERS_STATIC, tickDelta);
@@ -458,7 +463,7 @@ public final class ShadowBaker
                     {
                         profSpotOverlays++;
                     }
-                    ShadowRenderer.beginSpot(myTile, lx, ly, lz, dx, dy, dz, range, outerDeg, false, false);
+                    ShadowRenderer.beginSpot(myTile, lxD, lyD, lzD, dx, dy, dz, range, outerDeg, false, false);
                     renderInRangeCone(CASTERS_DYNAMIC, tickDelta);
                     ShadowRenderer.endPass();
                 }
@@ -470,7 +475,7 @@ public final class ShadowBaker
                 {
                     profSpotOverlays++;
                 }
-                ShadowRenderer.beginSpot(myTile, lx, ly, lz, dx, dy, dz, range, outerDeg, false, true);
+                ShadowRenderer.beginSpot(myTile, lxD, lyD, lzD, dx, dy, dz, range, outerDeg, false, true);
                 if (dyn)
                 {
                     renderInRangeCone(CASTERS_DYNAMIC, tickDelta);
@@ -507,6 +512,9 @@ public final class ShadowBaker
             float lx = LightRegistry.getX(i);
             float ly = LightRegistry.getY(i);
             float lz = LightRegistry.getZ(i);
+            // DOUBLE light position for the light-relative bake anchor + view eye
+            // (see the spot loop). Float lx/ly/lz remain the cull/cache/signature ABI.
+            double lxD = LightRegistry.getXd(i), lyD = LightRegistry.getYd(i), lzD = LightRegistry.getZd(i);
             float radius = LightRegistry.getRange(i);
             if (radius < 1e-3f)
             {
@@ -551,7 +559,7 @@ public final class ShadowBaker
                 }
                 for (int face = 0; face < 6; face++)
                 {
-                    ShadowRenderer.beginPointFace(myLayer, face, lx, ly, lz, radius, false, true);
+                    ShadowRenderer.beginPointFace(myLayer, face, lxD, lyD, lzD, radius, false, true);
                     if (entInRange > 0)
                     {
                         renderInRangeFace(face, CASTERS_ALL, tickDelta);
@@ -588,7 +596,7 @@ public final class ShadowBaker
                         }
                         for (int face = 0; face < 6; face++)
                         {
-                            ShadowRenderer.beginPointFace(myLayer, face, lx, ly, lz, radius, false, true);
+                            ShadowRenderer.beginPointFace(myLayer, face, lxD, lyD, lzD, radius, false, true);
                             if (staticInRangeScratch > 0)
                             {
                                 renderInRangeFace(face, CASTERS_STATIC, tickDelta);
@@ -638,7 +646,7 @@ public final class ShadowBaker
                     }
                     for (int face = 0; face < 6; face++)
                     {
-                        ShadowRenderer.beginPointFace(myLayer, face, lx, ly, lz, radius, true, true);
+                        ShadowRenderer.beginPointFace(myLayer, face, lxD, lyD, lzD, radius, true, true);
                         if (staticInRangeScratch > 0)
                         {
                             renderInRangeFace(face, CASTERS_STATIC, tickDelta);
@@ -694,7 +702,7 @@ public final class ShadowBaker
                         {
                             continue; // no dynamic caster reaches this face; the copy refreshed it
                         }
-                        ShadowRenderer.beginPointFace(myLayer, face, lx, ly, lz, radius, false, false);
+                        ShadowRenderer.beginPointFace(myLayer, face, lxD, lyD, lzD, radius, false, false);
                         renderInRangeFace(face, CASTERS_DYNAMIC, tickDelta);
                         ShadowRenderer.endPass();
                     }
@@ -711,7 +719,7 @@ public final class ShadowBaker
                 }
                 for (int face = 0; face < 6; face++)
                 {
-                    ShadowRenderer.beginPointFace(myLayer, face, lx, ly, lz, radius, false, true);
+                    ShadowRenderer.beginPointFace(myLayer, face, lxD, lyD, lzD, radius, false, true);
                     if (dyn)
                     {
                         renderInRangeFace(face, CASTERS_DYNAMIC, tickDelta);
