@@ -168,6 +168,15 @@ public final class LightRegistry
     public static float getX(int i) { return (float) px[i]; }
     public static float getY(int i) { return (float) py[i]; }
     public static float getZ(int i) { return (float) pz[i]; }
+
+    // Double-precision positions for the shadow bake's per-pass anchor + view eye
+    // (ShadowRenderer.beginSpot/beginPointFace). The float getX/Y/Z above are
+    // ~7.8mm pre-quantized at X=1e5 and must NOT source the eye; the anchor
+    // A = round((float) getXd) == round(getX) keeps lockstep with BlockShadowCache's
+    // block snap, while eye = L - A carries the full-precision sub-block light motion.
+    public static double getXd(int i) { return px[i]; }
+    public static double getYd(int i) { return py[i]; }
+    public static double getZd(int i) { return pz[i]; }
     public static float getDirX(int i) { return dx[i]; }
     public static float getDirY(int i) { return dy[i]; }
     public static float getDirZ(int i) { return dz[i]; }
