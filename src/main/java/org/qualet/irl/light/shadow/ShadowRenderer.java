@@ -68,6 +68,28 @@ public final class ShadowRenderer
      *  NOT RenderSystem's live matrices, which a caster can leave corrupted. */
     private static final Matrix4f currentProj = new Matrix4f();
 
+    // --- Per-pass bake anchor (light-relative bake) --------------------------
+    // The depth pass bakes every caster AND the light view matrix around this
+    // per-pass double anchor A = round(lightPos) instead of absolute world
+    // coordinates, so the float matrix math stays sub-block-magnitude and its
+    // error is translation-invariant far from the origin. A cancels exactly in
+    // view*vertex (view = R·Translate(-(L-A)), vertex = worldPos-A, so
+    // view*vertex = R·(worldPos-L)), leaving the stored perspective depth
+    // bit-identical — no shader/atlas/format change. Every caster arm (block VBO,
+    // cutout VBO, entity/model/replay Immediate) subtracts these BEFORE its float
+    // cast; the eye = L-A is set from the DOUBLE light position in begin*().
+    // round(lightPos) (not L itself) keeps the light's sub-block motion in the
+    // per-frame eye and OUT of the per-light cached block/cutout VBO: it is
+    // byte-identical to BlockShadowCache's block snap (round of the same float
+    // getX), so the shared pass anchor always matches the anchor the cached VBO
+    // was built with (a light drifting within its 1-block cell reuses the VBO and
+    // is tracked exactly by the recomputed eye).
+    private static double currentOriginX, currentOriginY, currentOriginZ;
+
+    public static double currentOriginX() { return currentOriginX; }
+    public static double currentOriginY() { return currentOriginY; }
+    public static double currentOriginZ() { return currentOriginZ; }
+
     // --- Reused matrix scratch (T1.3) ----------------------------------------
     // RenderSystem.setProjectionMatrix copies its argument, and the block batch
     // draws with currentProj (a copy made in applyMatrices), so reusing these
@@ -109,12 +131,24 @@ public final class ShadowRenderer
      * static base just restored by {@link SpotlightDepthAtlas#copyStaticToLive}.
      */
     public static void beginSpot(int tile,
-                                 float lpx, float lpy, float lpz,
+                                 double lpx, double lpy, double lpz,
                                  float ldx, float ldy, float ldz,
                                  float range, float outerDeg,
                                  boolean toStatic, boolean clear)
     {
         savePassState();
+
+        // Light-relative bake anchor for this pass (see currentOrigin* docs):
+        // A = round((float) lightPos) == BlockShadowCache's block snap, so the
+        // shared pass anchor stays in lockstep with the cached block/cutout VBO.
+        // eye = L - A keeps the full-precision sub-block light motion in the view
+        // while the caster arms subtract A from their world coords.
+        currentOriginX = Math.round((float) lpx);
+        currentOriginY = Math.round((float) lpy);
+        currentOriginZ = Math.round((float) lpz);
+        float ex = (float) (lpx - currentOriginX);
+        float ey = (float) (lpy - currentOriginY);
+        float ez = (float) (lpz - currentOriginZ);
 
         GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, SpotlightDepthAtlas.getFboId(toStatic));
         int px = SpotlightDepthAtlas.tilePixelX(tile);
@@ -140,8 +174,8 @@ public final class ShadowRenderer
 
         Vector3f up = pickStableUp(ldy);
         currentView.identity().lookAt(
-            lpx, lpy, lpz,
-            lpx + ldx, lpy + ldy, lpz + ldz,
+            ex, ey, ez,
+            ex + ldx, ey + ldy, ez + ldz,
             up.x, up.y, up.z
         );
 
@@ -155,11 +189,19 @@ public final class ShadowRenderer
      * {@link PointShadowArray#copyStaticToLive}).
      */
     public static void beginPointFace(int slot, int face,
-                                      float lpx, float lpy, float lpz,
+                                      double lpx, double lpy, double lpz,
                                       float radius,
                                       boolean toStatic, boolean clear)
     {
         savePassState();
+
+        // Light-relative bake anchor (see beginSpot / currentOrigin* docs).
+        currentOriginX = Math.round((float) lpx);
+        currentOriginY = Math.round((float) lpy);
+        currentOriginZ = Math.round((float) lpz);
+        float ex = (float) (lpx - currentOriginX);
+        float ey = (float) (lpy - currentOriginY);
+        float ez = (float) (lpz - currentOriginZ);
 
         PointShadowArray.bindFaceForRender(slot, face, toStatic);
         int fs = PointShadowArray.FACE_SIZE;
@@ -191,8 +233,8 @@ public final class ShadowRenderer
         }
 
         currentView.identity().lookAt(
-            lpx, lpy, lpz,
-            lpx + dx, lpy + dy, lpz + dz,
+            ex, ey, ez,
+            ex + dx, ey + dy, ez + dz,
             ux, uy, uz
         );
 
@@ -485,6 +527,13 @@ public final class ShadowRenderer
             .begin(VertexFormat.DrawMode.QUADS, VertexFormats.POSITION);
 
         QuadBoxConsumer consumer = new QuadBoxConsumer(buf);
+        // Light-relative bake: the consumer subtracts the pass anchor in double
+        // before its float cast. The anchor A == BlockShadowCache's snap, so it is
+        // stable for the life of this cached VBO (rebuilt only when the block list
+        // instance — hence A — changes), keeping the VBO consistent with the eye.
+        consumer.originX = currentOriginX;
+        consumer.originY = currentOriginY;
+        consumer.originZ = currentOriginZ;
         for (int i = 0, n = blocks.size(); i < n; i++)
         {
             BlockShadowEntry entry = blocks.get(i);
@@ -707,7 +756,9 @@ public final class ShadowRenderer
             }
 
             stack.push();
-            stack.translate(p.getX(), p.getY(), p.getZ());
+            // Light-relative bake: int block coord minus the double pass anchor is
+            // a small double, cast to float exactly inside MatrixStack.translate.
+            stack.translate(p.getX() - currentOriginX, p.getY() - currentOriginY, p.getZ() - currentOriginZ);
             cutoutRandom.setSeed(state.getRenderingSeed(p));
             try
             {
@@ -777,6 +828,10 @@ public final class ShadowRenderer
     {
         final BufferBuilder buf;
         int ox, oy, oz;
+        /** Light-relative bake anchor (= ShadowRenderer.currentOrigin* when the
+         *  VBO was built), subtracted in double before the float cast so the
+         *  emitted quad coords stay sub-block-magnitude far from the origin. */
+        double originX, originY, originZ;
 
         QuadBoxConsumer(BufferBuilder buf)
         {
@@ -787,12 +842,12 @@ public final class ShadowRenderer
         public void consume(double minX, double minY, double minZ,
                             double maxX, double maxY, double maxZ)
         {
-            float x1 = (float) (ox + minX);
-            float y1 = (float) (oy + minY);
-            float z1 = (float) (oz + minZ);
-            float x2 = (float) (ox + maxX);
-            float y2 = (float) (oy + maxY);
-            float z2 = (float) (oz + maxZ);
+            float x1 = (float) (ox - originX + minX);
+            float y1 = (float) (oy - originY + minY);
+            float z1 = (float) (oz - originZ + minZ);
+            float x2 = (float) (ox - originX + maxX);
+            float y2 = (float) (oy - originY + maxY);
+            float z2 = (float) (oz - originZ + maxZ);
 
             // -X  (1.21: VertexConsumer.next() removed — each vertex() starts a new vertex)
             buf.vertex(x1, y1, z1);
