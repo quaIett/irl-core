@@ -473,6 +473,7 @@ public final class LightRegistry
     public static void flush(double originX, double originY, double originZ)
     {
         LightBuffer.begin();
+        ClusterGridBuffer.begin();
 
         // A render-path registration between prioritize() and here would leave
         // order[] stale; rebuild it from the flush origin (= the camera) so the cap
@@ -516,8 +517,25 @@ public final class LightRegistry
                 LightBuffer.addSpot(rx, ry, rz, dx[i], dy[i], dz[i], cr[i], cg[i], cb[i], intensity[i], radius[i], cosOuter[i], cosInner[i], lightMask, anisotropy[i], density[i], beam[i], (float) shadowTile[i], bulbSize[i], cookieLayer[i], cookieRot[i], cookieScale[i], cookieFlags[i]);
             }
 
+            // Snapshot this light for Phase 3 clustering: uploadedCount is the SAME
+            // pre-increment cursor that indexes uploadedIds below, so it is this
+            // light's PACKED index in the SSBO (binding 7) — i.e. its cluster mask
+            // bit. Only the first MASK_LIGHTS get bits; the shader runs the tail
+            // unmasked. Positions are the camera-relative rx/ry/rz computed above;
+            // tiles are projected later, in ClusterGridBuffer.buildAndUpload.
+            if (uploadedCount < ClusterGridBuffer.MASK_LIGHTS)
+            {
+                ClusterGridBuffer.record(uploadedCount, rx, ry, rz, radius[i]);
+            }
+
             uploadedIds[uploadedCount++] = id[i];
         }
+
+        // Snapshot is complete for this frame — mark it fresh so the late
+        // gbuffer-matrix hook rasterises THESE lights (and flags becomes 1) even
+        // when zero were recorded: an all-zero mask is correct, the shader
+        // early-outs on count==0. No-op while clustering is disabled.
+        ClusterGridBuffer.markSnapshotFresh();
 
         LightBuffer.upload();
 
