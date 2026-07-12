@@ -109,6 +109,12 @@ public final class FramePipeline
 
         source.collect(world, cameraPos, tickDelta);
 
+        // Rank this frame's lights by camera-distance priority BEFORE the bake, so
+        // the shadow baker hands out tiles / static-bake budget to the highest-
+        // priority lights first and the deferred flush caps the SSBO upload to that
+        // same order.
+        LightRegistry.prioritize(cameraPos.x, cameraPos.y, cameraPos.z);
+
         // Bake spotlight shadow depth maps BEFORE the SSBO upload (sets each
         // spot's shadow tile index) and before Iris activates (vanilla entity
         // rendering writes into our depth FBO).

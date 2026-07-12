@@ -155,13 +155,29 @@ public final class ShadowBaker
     private static final int[] pointSlotActive = new int[PointShadowArray.MAX_SHADOWS];
     /** Monotonic bake counter driving the staleness test (not wall time). */
     private static int frameIndex;
-    /** Remaining FULL STATIC bakes this frame (T2.4). Reset each frame from
-     *  {@link ShadowConfig#shadowBakeBudget()} ({@code <= 0} -> unlimited).
-     *  Deferrable static bakes run only while this is positive; mandatory ones
-     *  (first bake / tile reassigned, can't show a blank or foreign map) run
-     *  regardless and still consume a unit, so they don't starve later lamps of
-     *  a deferral. Dynamic overlays and static->live copies are NOT counted. */
+    /** Remaining DEFERRABLE full static bakes this frame (T2.4). Reset each frame
+     *  from {@link ShadowConfig#shadowBakeBudget()} ({@code <= 0} -> unlimited).
+     *  A re-bake with our own valid map still on the tile runs only while this is
+     *  positive. Mandatory bakes (first bake / tile reassigned / a subject
+     *  leaving) also decrement it — so they defer the frame's remaining
+     *  deferrable bakes — but their gate is {@link #mandatoryBakeBudget}
+     *  (throttleable) or nothing at all (forced), never this counter. Dynamic
+     *  overlays and static->live copies are NOT counted. */
     private static int staticBakeBudget;
+    /** Remaining MANDATORY-THROTTLEABLE full static bakes this frame (C2). Reset
+     *  to {@code max(1, budget)} ({@code <= 0} -> unlimited) at frame start AND
+     *  again before the point loop, so the spot and point loops get independent
+     *  pools — far spots (baked first) can't starve near points of a first bake.
+     *  Caps the cold-start spike (first bake / shadow-quality change / shaders
+     *  re-enabled, where dozens of lights first-bake at once): a first bake /
+     *  just-reassigned tile bake (no own map to fall back on) runs only while this
+     *  is positive — beyond it the light is marked shadow-pending
+     *  ({@link LightRegistry#setShadowPending}) and OMITTED from the SSBO for the
+     *  frame (no shadow -> no light, never unshadowed-through-walls), retrying next
+     *  frame nearest-first (C1). Forced bakes (a subject leaving, which can't be
+     *  deferred) bypass the gate but still decrement this, so they can't let extra
+     *  cold bakes slip past the frame's cap. */
+    private static int mandatoryBakeBudget;
     /** Last seen shadow-quality setting; a change frees + re-allocates the
      *  depth textures, so every cached map must be forgotten with it. */
     private static int lastQuality = Integer.MIN_VALUE;
@@ -254,9 +270,14 @@ public final class ShadowBaker
         int n = LightRegistry.getCount();
         boolean cache = ShadowEngine.config().shadowCache();
         frameIndex++;
-        // Per-frame full-static-bake budget (T2.4). <= 0 means unlimited.
+        // Per-frame full-static-bake budgets (T2.4 deferrable / C2 mandatory).
+        // <= 0 means unlimited. The deferrable pool spans the whole frame; the
+        // mandatory pool is re-inited per loop (here for spots, again before the
+        // point loop) so the two types don't starve each other. max(1, ...) keeps
+        // at least one mandatory bake so a lone cold light can never stall forever.
         int budget = ShadowEngine.config().shadowBakeBudget();
         staticBakeBudget = budget <= 0 ? Integer.MAX_VALUE : budget;
+        mandatoryBakeBudget = budget <= 0 ? Integer.MAX_VALUE : Math.max(1, budget);
         ShadowRenderer.beginBake();
 
         // Behind-camera cull inputs: a light whose whole influence sphere is
@@ -272,8 +293,12 @@ public final class ShadowBaker
         double fwdZ = haveFwd ? cameraForward.z : 0.0;
 
         // --- spotlights: one perspective atlas tile each ---
-        for (int i = 0; i < n; i++)
+        // Iterate in priority order (perf C1): tiles + the static-bake budget go
+        // to the highest-priority lights first. Tiles are sticky per id, so the
+        // reordering never re-bakes an otherwise-unchanged light.
+        for (int k = 0; k < n; k++)
         {
+            int i = LightRegistry.orderedIndex(k);
             if (LightRegistry.getType(i) != 1)
             {
                 continue;
@@ -380,11 +405,13 @@ public final class ShadowBaker
                     || lastTile.get(id) != myTile;          // assigned a different tile
                 if (dirty)
                 {
-                    // First bake / tile reassigned can't be deferred — the live
-                    // tile holds no map of our own to keep showing. A deferrable
-                    // re-bake runs only within this frame's budget (T2.4).
+                    // First bake / tile reassigned has no map of our own on the
+                    // live tile, so it's throttled by the mandatory budget (C2)
+                    // rather than freely deferrable (T2.4) — but it still can't be
+                    // dropped silently: a refusal marks it shadow-pending below, so
+                    // flush omits it (no light) instead of leaking it unshadowed.
                     boolean mustBake = !lastTile.containsKey(id) || lastTile.get(id) != myTile;
-                    if (allowStaticBake(mustBake))
+                    if (allowStaticBake(mustBake ? BAKE_MANDATORY : BAKE_DEFERRABLE))
                     {
                         if (PROFILE)
                         {
@@ -404,9 +431,22 @@ public final class ShadowBaker
                         SpotShadowEvsm.markDirty(myTile, range);
                         rememberLive(id, sig, myTile, blocks, false);
                     }
-                    // else deferred: keep our own (older) live map and leave the
-                    // dirty state untouched so this re-bake retries next frame —
-                    // the SSBO already points at myTile (set above).
+                    else if (mustBake)
+                    {
+                        // Mandatory bake throttled this frame: the live tile holds
+                        // no map of our own (first bake / just-reassigned tile).
+                        // Publishing -1 would render the light UNSHADOWED (leaking
+                        // through walls); publishing myTile would sample foreign
+                        // content. So mark it shadow-pending — flush omits it from
+                        // the SSBO this frame (no shadow -> no light). Ownership is
+                        // kept (acquireTile ran this frame) and the dirty state is
+                        // left untouched, so next frame mustBake is still true and
+                        // the bake retries, nearest-first (C1).
+                        LightRegistry.setShadowPending(i);
+                    }
+                    // else deferrable re-bake deferred: keep our own (older) live
+                    // map, SSBO still points at myTile; dirty state untouched so
+                    // this re-bake retries next frame.
                 }
                 else
                 {
@@ -436,7 +476,10 @@ public final class ShadowBaker
                 boolean staticMustBake = !dyn
                     || !lastStaticTile.containsKey(id)
                     || lastStaticTile.get(id) != myTile;
-                if (staticStale && allowStaticBake(staticMustBake))
+                // A must-bake here is FORCED (the copy below has no valid base to
+                // fall back on, or the leave transition can't carry over) — never
+                // throttled; the deferrable case still honours the frame budget.
+                if (staticStale && allowStaticBake(staticMustBake ? BAKE_FORCED : BAKE_DEFERRABLE))
                 {
                     if (PROFILE)
                     {
@@ -501,9 +544,20 @@ public final class ShadowBaker
         SpotShadowPyramid.flushDirty();
         SpotShadowEvsm.flushDirty();
 
+        // Give the point loop its own mandatory pool (C2): the spot and point
+        // loops run sequentially, so a shared pool lets far spots (baked first)
+        // starve near points of a first bake — a starved point marks itself
+        // shadow-pending and shows no light at all until the spots drain. Per-type
+        // pools keep each type's cold-start bounded and priority-ordered on its
+        // own. The deferrable pool stays shared frame-wide (a deferred re-bake
+        // keeps its own map, so sharing it costs a staler shadow, never a leak).
+        mandatoryBakeBudget = budget <= 0 ? Integer.MAX_VALUE : Math.max(1, budget);
+
         // --- point lights: cube-array, 6 faces each ---
-        for (int i = 0; i < n; i++)
+        // Priority order, sticky tiles (see the spot loop).
+        for (int k = 0; k < n; k++)
         {
+            int i = LightRegistry.orderedIndex(k);
             if (LightRegistry.getType(i) != 0)
             {
                 continue;
@@ -585,10 +639,11 @@ public final class ShadowBaker
                     || lastTile.get(id) != myLayer;
                 if (dirty)
                 {
-                    // First bake / tile reassigned can't be deferred; a deferrable
-                    // re-bake runs only within this frame's budget (T2.4).
+                    // First bake / tile reassigned: throttled by the mandatory
+                    // budget (C2), not freely deferrable (T2.4); a refusal marks it
+                    // shadow-pending below (flush omits it, see the spot loop).
                     boolean mustBake = !lastTile.containsKey(id) || lastTile.get(id) != myLayer;
-                    if (allowStaticBake(mustBake))
+                    if (allowStaticBake(mustBake ? BAKE_MANDATORY : BAKE_DEFERRABLE))
                     {
                         if (PROFILE)
                         {
@@ -611,8 +666,20 @@ public final class ShadowBaker
                         PointShadowEvsm.markDirty(myLayer, radius);
                         rememberLive(id, sig, myLayer, blocks, false);
                     }
-                    // else deferred: keep our own (older) live cube; dirty state
-                    // unchanged so the re-bake retries next frame (SSBO -> myLayer).
+                    else if (mustBake)
+                    {
+                        // Mandatory bake throttled this frame: no cube of our own
+                        // on this slot (first bake / just-reassigned). Mark it
+                        // shadow-pending — flush omits it (no shadow -> no light)
+                        // rather than uploading it unshadowed (leaking through
+                        // walls) or sampling foreign faces. Ownership kept, dirty
+                        // state untouched -> retries next frame, nearest-first
+                        // (C1). See the spot loop.
+                        LightRegistry.setShadowPending(i);
+                    }
+                    // else deferrable re-bake deferred: keep our own (older) live
+                    // cube; dirty state unchanged so it retries next frame
+                    // (SSBO -> myLayer).
                 }
                 else
                 {
@@ -637,7 +704,10 @@ public final class ShadowBaker
                     || !lastStaticTile.containsKey(id)
                     || lastStaticTile.get(id) != myLayer;
                 boolean bakedStatic = false;
-                if (staticStale && allowStaticBake(staticMustBake))
+                // Must-bake here is FORCED (no valid base for the copy, or a leave
+                // transition) — never throttled; the deferrable case still honours
+                // the frame budget (see the spot overlay note).
+                if (staticStale && allowStaticBake(staticMustBake ? BAKE_FORCED : BAKE_DEFERRABLE))
                 {
                     bakedStatic = true;
                     if (PROFILE)
@@ -829,23 +899,48 @@ public final class ShadowBaker
         return take;
     }
 
-    /** Budget gate for one FULL STATIC bake (T2.4). {@code mustBake} bakes
-     *  (first bake / tile reassigned — no own map to fall back on; or a subject
-     *  leaving, where the staleness bookkeeping can't carry over) always
-     *  proceed; otherwise the bake runs only while this frame's budget remains.
-     *  A bake that runs consumes one unit either way (mandatory bakes may push
-     *  the budget below zero, which simply defers the frame's remaining
-     *  deferrable bakes). Returns true to bake now, false to defer — the caller
-     *  then keeps the existing map and leaves its dirty state untouched, so the
-     *  same re-bake is retried next frame. */
-    private static boolean allowStaticBake(boolean mustBake)
+    /** A re-bake whose own valid map still sits on the tile: deferrable, so it
+     *  runs only while the deferrable budget remains. */
+    private static final int BAKE_DEFERRABLE = 0;
+    /** First bake / just-reassigned tile: no own map to fall back on, so it can't
+     *  be freely deferred — but it IS throttled by {@link #mandatoryBakeBudget}
+     *  to cap the cold-start spike. When the gate refuses, the caller marks the
+     *  light shadow-pending so flush OMITS it (no shadow -> no light, not
+     *  unshadowed-through-walls) and retries next frame (C2). */
+    private static final int BAKE_MANDATORY = 1;
+    /** A subject leaving a lamp (dyn->static in the overlay path): the transition
+     *  bookkeeping can't carry over, so the base must bake this frame — never
+     *  throttled. */
+    private static final int BAKE_FORCED = 2;
+
+    /** Budget gate for one FULL STATIC bake (T2.4 / C2). By {@code kind}:
+     *  {@link #BAKE_DEFERRABLE} runs only while {@link #staticBakeBudget} > 0;
+     *  {@link #BAKE_MANDATORY} runs only while {@link #mandatoryBakeBudget} > 0
+     *  (bounding the cold-start spike); {@link #BAKE_FORCED} always runs. A bake
+     *  that runs consumes one unit of {@link #staticBakeBudget} either way (so
+     *  mandatory/forced bakes defer the frame's remaining deferrable bakes), and
+     *  the two mandatory kinds also consume one unit of {@link #mandatoryBakeBudget}
+     *  (so a forced bake can't let an extra cold bake slip past the frame's cap).
+     *  Both budgets may go below zero. Returns true to bake now, false to defer —
+     *  the caller then falls back (keep the existing map, or mark the light
+     *  shadow-pending so flush omits it for a refused mandatory bake) and leaves
+     *  its dirty state untouched so the same re-bake is retried next frame. */
+    private static boolean allowStaticBake(int kind)
     {
-        if (mustBake || staticBakeBudget > 0)
+        if (kind == BAKE_MANDATORY && mandatoryBakeBudget <= 0)
         {
-            staticBakeBudget--;
-            return true;
+            return false;
         }
-        return false;
+        if (kind == BAKE_DEFERRABLE && staticBakeBudget <= 0)
+        {
+            return false;
+        }
+        staticBakeBudget--;
+        if (kind != BAKE_DEFERRABLE)
+        {
+            mandatoryBakeBudget--;
+        }
+        return true;
     }
 
     /** Drop one light's dirty state so its next bake is a clean first bake
