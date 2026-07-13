@@ -42,7 +42,9 @@ public final class SpotShadowPyramid
     private static int program = 0;
     private static int uSrcTex, uSrcLod, uSrcIsDepth, uSrcOrigin, uDstOrigin, uDstSize;
     private static boolean programAttempted = false;
-    private static int dirtyMask = 0;
+    /** One bit per flat atlas tile (1L << tile); long because the quadtree
+     *  layout allows up to 64 tiles (guarded in SpotlightDepthAtlas). */
+    private static long dirtyMask = 0L;
 
     private static final String COMPUTE_SRC =
         "#version 430 core\n" +
@@ -92,9 +94,9 @@ public final class SpotShadowPyramid
      *  static->live copy + overlay) that changed the tile's live depth. */
     public static void markDirty(int tile)
     {
-        if (tile >= 0 && tile < SpotlightDepthAtlas.MAX_TILES)
+        if (tile >= 0 && tile < SpotlightDepthAtlas.tileCount())
         {
-            dirtyMask |= 1 << tile;
+            dirtyMask |= 1L << tile;
         }
     }
 
@@ -103,12 +105,12 @@ public final class SpotShadowPyramid
      *  flush / Iris passes). */
     public static void flushDirty()
     {
-        if (dirtyMask == 0)
+        if (dirtyMask == 0L)
         {
             return;
         }
-        int mask = dirtyMask;
-        dirtyMask = 0;
+        long mask = dirtyMask;
+        dirtyMask = 0L;
         int depthTex = SpotlightDepthAtlas.getGlTextureId();
         if (depthTex == 0)
         {
@@ -137,24 +139,28 @@ public final class SpotShadowPyramid
         GlStateManager._glUseProgram(program);
         GL20.glUniform1i(uSrcTex, unit);
 
-        int tileSize = SpotlightDepthAtlas.TILE_SIZE;
-        int base = tileSize / 2; // tile region width at pyramid lod 0
+        // All tile rects come from the SpotlightDepthAtlas accessors — the one
+        // rect source of the quadtree layout. INVARIANT (holds by construction,
+        // power-of-two subdivision): every tile origin is a multiple of its own
+        // tileSizePx, so shifting origin and size right in lockstep is exact at
+        // every lod (no fractional texel ever appears).
 
         // pass 0: depth atlas -> pyramid lod 0, all dirty tiles, one barrier
         GlStateManager._bindTexture(depthTex);
         GL20.glUniform1i(uSrcIsDepth, 1);
         GL20.glUniform1i(uSrcLod, 0);
         bindDstLevel(0);
-        for (int tile = 0; tile < SpotlightDepthAtlas.MAX_TILES; tile++)
+        for (int tile = 0; tile < SpotlightDepthAtlas.tileCount(); tile++)
         {
-            if ((mask & (1 << tile)) == 0)
+            if ((mask & (1L << tile)) == 0L)
             {
                 continue;
             }
-            int tx = tile % SpotlightDepthAtlas.GRID_X;
-            int ty = tile / SpotlightDepthAtlas.GRID_X;
-            GL20.glUniform2i(uSrcOrigin, tx * tileSize, ty * tileSize);
-            dispatchTile(tx * base, ty * base, base);
+            int pixX = SpotlightDepthAtlas.tilePixelX(tile);
+            int pixY = SpotlightDepthAtlas.tilePixelY(tile);
+            int sz = SpotlightDepthAtlas.tileSizePx(tile);
+            GL20.glUniform2i(uSrcOrigin, pixX, pixY);
+            dispatchTile(pixX >> 1, pixY >> 1, sz >> 1);
         }
         GL42.glMemoryBarrier(GL42.GL_TEXTURE_FETCH_BARRIER_BIT);
 
@@ -164,20 +170,27 @@ public final class SpotShadowPyramid
         GL20.glUniform1i(uSrcIsDepth, 0);
         for (int lod = 1; lod < levels; lod++)
         {
-            int srcW = base >> (lod - 1);
-            int dstW = base >> lod;
             GL20.glUniform1i(uSrcLod, lod - 1);
             bindDstLevel(lod);
-            for (int tile = 0; tile < SpotlightDepthAtlas.MAX_TILES; tile++)
+            for (int tile = 0; tile < SpotlightDepthAtlas.tileCount(); tile++)
             {
-                if ((mask & (1 << tile)) == 0)
+                if ((mask & (1L << tile)) == 0L)
                 {
                     continue;
                 }
-                int tx = tile % SpotlightDepthAtlas.GRID_X;
-                int ty = tile / SpotlightDepthAtlas.GRID_X;
-                GL20.glUniform2i(uSrcOrigin, tx * srcW, ty * srcW);
-                dispatchTile(tx * dstW, ty * dstW, dstW);
+                int pixX = SpotlightDepthAtlas.tilePixelX(tile);
+                int pixY = SpotlightDepthAtlas.tilePixelY(tile);
+                int dstW = SpotlightDepthAtlas.tileSizePx(tile) >> (lod + 1);
+                if (dstW == 0)
+                {
+                    // A sub-tile's chain ends at one texel per sub-tile — a
+                    // deeper lod would mix neighbouring tiles. Full-size tiles
+                    // (the whole degenerate layout) never hit this: levels =
+                    // log2(TILE_SIZE) already bottoms them out at one texel.
+                    continue;
+                }
+                GL20.glUniform2i(uSrcOrigin, pixX >> lod, pixY >> lod);
+                dispatchTile(pixX >> (lod + 1), pixY >> (lod + 1), dstW);
             }
             // next level's texelFetches (and finally the deferred pass) read what this level stored
             GL42.glMemoryBarrier(GL42.GL_TEXTURE_FETCH_BARRIER_BIT);
@@ -284,6 +297,6 @@ public final class SpotShadowPyramid
             texId = 0;
         }
         levels = 0;
-        dirtyMask = 0;
+        dirtyMask = 0L;
     }
 }

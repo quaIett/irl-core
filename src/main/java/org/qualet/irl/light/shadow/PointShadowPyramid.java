@@ -12,15 +12,20 @@ import org.lwjgl.opengl.GL42;
 import org.lwjgl.opengl.GL43;
 
 /**
- * Min/max mip pyramid over the LIVE point shadow cube-array (F1b). Stored as a
- * plain GL_TEXTURE_2D_ARRAY, face-major (layer = slot*6 + face), RG32F, base
- * level = face/2, mip chain down to one texel per face. The inject samples it
- * as {@code irl_pointShadowPyramid} (registered as 2D in Iris, rebound to
- * 2D_ARRAY by the host mod's SamplerBinding mixin, like the cookie array) for
- * a 4-texelFetch conservative classification before PCSS; taps whose footprint
- * crosses a cube-face border skip the early-out entirely (occluders on the
- * adjacent face are invisible to a face-local pyramid — the full PCSS path
- * handles the seam via real cube sampling).
+ * Min/max mip pyramid over the LIVE point shadow cube-array (F1b). One INSTANCE
+ * per {@link PointShadowArray} tier (owned by it, reached via
+ * {@link PointShadowArray#pyramid()}); all sizes/slot counts come from the
+ * owning array, so each tier's pyramid tracks its tier's resolution. The
+ * compute programs are size-independent (sizes flow through uniforms) and stay
+ * SHARED across instances. Stored as a plain GL_TEXTURE_2D_ARRAY, face-major
+ * (layer = slot*6 + face), RG32F, base level = face/2, mip chain down to one
+ * texel per face. The inject samples it as {@code irl_pointShadowPyramid}
+ * (registered as 2D in Iris, rebound to 2D_ARRAY by the host mod's
+ * SamplerBinding mixin, like the cookie array) for a 4-texelFetch conservative
+ * classification before PCSS; taps whose footprint crosses a cube-face border
+ * skip the early-out entirely (occluders on the adjacent face are invisible to
+ * a face-local pyramid — the full PCSS path handles the seam via real cube
+ * sampling).
  *
  * Same batched contract as {@link SpotShadowPyramid}: ShadowBaker marks slots
  * dirty after every write to their live faces and calls {@link #flushDirty()}
@@ -36,14 +41,19 @@ import org.lwjgl.opengl.GL43;
  */
 public final class PointShadowPyramid
 {
-    private static int texId = 0;
-    private static int levels = 0;
+    private final PointShadowArray owner;
+
+    private int texId = 0;
+    private int levels = 0;
+    private int dirtyMask = 0;
+
+    // Compute programs + uniform locations: SHARED across all tier instances —
+    // the GLSL sources are size-independent, every size flows through uniforms.
     private static int progCube = 0;   // pass 0: depth cube -> pyramid lod 0
     private static int progMip = 0;    // lod L-1 -> lod L
     private static int uCubeSrc, uCubeSlot, uCubeDstSize;
     private static int uMipSrc, uMipSrcLod, uMipLayerBase, uMipDstSize;
     private static boolean programsAttempted = false;
-    private static int dirtyMask = 0;
 
     private static final String CUBE_SRC =
         "#version 430 core\n" +
@@ -103,21 +113,23 @@ public final class PointShadowPyramid
         "    imageStore(dstMip, ivec3(g, layer), vec4(mn, mx, 0.0, 0.0));\n" +
         "}\n";
 
-    private PointShadowPyramid()
-    {}
+    PointShadowPyramid(PointShadowArray owner)
+    {
+        this.owner = owner;
+    }
 
     /** Lazy — 0 until the first flush; bound by name via the host mod's sampler
      *  mixins (registered 2D, rebound to GL_TEXTURE_2D_ARRAY). */
-    public static int getGlTextureId()
+    public int getGlTextureId()
     {
         return texId;
     }
 
     /** Mark one slot's 6 pyramid faces stale. Call after every bake/copy that
      *  changed any of the slot's live faces. */
-    public static void markDirty(int slot)
+    public void markDirty(int slot)
     {
-        if (slot >= 0 && slot < PointShadowArray.MAX_SHADOWS)
+        if (slot >= 0 && slot < owner.slotCount())
         {
             dirtyMask |= 1 << slot;
         }
@@ -125,7 +137,7 @@ public final class PointShadowPyramid
 
     /** Rebuild every dirty slot's pyramid (all 6 faces) in one batch. Call once
      *  per bake, after the point loop (before the SSBO flush / Iris passes). */
-    public static void flushDirty()
+    public void flushDirty()
     {
         if (dirtyMask == 0)
         {
@@ -133,7 +145,7 @@ public final class PointShadowPyramid
         }
         int mask = dirtyMask;
         dirtyMask = 0;
-        int depthTex = PointShadowArray.getGlTextureId();
+        int depthTex = owner.getGlTextureId();
         if (depthTex == 0)
         {
             return;
@@ -158,7 +170,7 @@ public final class PointShadowPyramid
 
         GL42.glMemoryBarrier(GL42.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
-        int base = PointShadowArray.FACE_SIZE / 2;
+        int base = owner.getFaceSize() / 2;
 
         // pass 0: depth cube -> pyramid lod 0, all dirty slots (z = 6 faces per dispatch), one barrier
         GlStateManager._glUseProgram(progCube);
@@ -166,7 +178,7 @@ public final class PointShadowPyramid
         GL11.glBindTexture(GL40.GL_TEXTURE_CUBE_MAP_ARRAY, depthTex);
         GL42.glBindImageTexture(0, texId, 0, true, 0, GL15.GL_WRITE_ONLY, GL30.GL_RG32F);
         GL20.glUniform2i(uCubeDstSize, base, base);
-        for (int slot = 0; slot < PointShadowArray.MAX_SHADOWS; slot++)
+        for (int slot = 0; slot < owner.slotCount(); slot++)
         {
             if ((mask & (1 << slot)) == 0)
             {
@@ -187,7 +199,7 @@ public final class PointShadowPyramid
             GL20.glUniform1i(uMipSrcLod, lod - 1);
             GL42.glBindImageTexture(0, texId, lod, true, 0, GL15.GL_WRITE_ONLY, GL30.GL_RG32F);
             GL20.glUniform2i(uMipDstSize, dstW, dstW);
-            for (int slot = 0; slot < PointShadowArray.MAX_SHADOWS; slot++)
+            for (int slot = 0; slot < owner.slotCount(); slot++)
             {
                 if ((mask & (1 << slot)) == 0)
                 {
@@ -213,7 +225,7 @@ public final class PointShadowPyramid
         }
     }
 
-    private static void ensureResources()
+    private void ensureResources()
     {
         if (!programsAttempted)
         {
@@ -242,10 +254,10 @@ public final class PointShadowPyramid
         int prevArr = GL11.glGetInteger(GL30.GL_TEXTURE_BINDING_2D_ARRAY);
         texId = GL11.glGenTextures();
         GL11.glBindTexture(GL30.GL_TEXTURE_2D_ARRAY, texId);
-        // base = face/2; levels = log2(FACE_SIZE): the deepest lod is one texel per face
-        levels = Integer.numberOfTrailingZeros(Integer.highestOneBit(PointShadowArray.FACE_SIZE));
-        int base = PointShadowArray.FACE_SIZE / 2;
-        GL43.glTexStorage3D(GL30.GL_TEXTURE_2D_ARRAY, levels, GL30.GL_RG32F, base, base, PointShadowArray.LAYER_COUNT);
+        // base = face/2; levels = log2(faceSize): the deepest lod is one texel per face
+        levels = Integer.numberOfTrailingZeros(Integer.highestOneBit(owner.getFaceSize()));
+        int base = owner.getFaceSize() / 2;
+        GL43.glTexStorage3D(GL30.GL_TEXTURE_2D_ARRAY, levels, GL30.GL_RG32F, base, base, owner.layerCount());
         GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);
         GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST);
         GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_WRAP_S, GL12.GL_CLAMP_TO_EDGE);
@@ -279,10 +291,10 @@ public final class PointShadowPyramid
         return prog;
     }
 
-    /** Free the texture (called with PointShadowArray.delete(), e.g. preset
-     *  switch). 2D-array bindings are not tracked by GlStateManager, so a raw
-     *  delete is safe here (unlike the 2D spot pyramid). */
-    public static void delete()
+    /** Free the texture (called with the owning PointShadowArray's delete(),
+     *  e.g. preset switch). 2D-array bindings are not tracked by GlStateManager,
+     *  so a raw delete is safe here (unlike the 2D spot pyramid). */
+    public void delete()
     {
         if (texId != 0)
         {

@@ -151,7 +151,7 @@ public final class ShadowRenderer
         GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, SpotlightDepthAtlas.getFboId(toStatic));
         int px = SpotlightDepthAtlas.tilePixelX(tile);
         int py = SpotlightDepthAtlas.tilePixelY(tile);
-        int ts = SpotlightDepthAtlas.TILE_SIZE;
+        int ts = SpotlightDepthAtlas.tileSizePx(tile);
         GL11.glViewport(px, py, ts, ts);
         GL11.glEnable(GL11.GL_SCISSOR_TEST);
         GL11.glScissor(px, py, ts, ts);
@@ -184,7 +184,9 @@ public final class ShadowRenderer
      * Begin a point-cube face depth pass into the live or static array (see
      * {@link #beginSpot} for the {@code toStatic}/{@code clear} semantics; the
      * static base of a whole cube is restored by
-     * {@link PointShadowArray#copyStaticToLive}).
+     * {@link PointShadowArray#copyStaticToLive}). {@code slot} is the GLOBAL
+     * tier-space slot (the value published to vlParams.w); it is resolved to
+     * the owning LOD tier's array + local cube layer here.
      */
     public static void beginPointFace(int slot, int face,
                                       double lpx, double lpy, double lpz,
@@ -201,8 +203,9 @@ public final class ShadowRenderer
         float ey = (float) (lpy - currentOriginY);
         float ez = (float) (lpz - currentOriginZ);
 
-        PointShadowArray.bindFaceForRender(slot, face, toStatic);
-        int fs = PointShadowArray.FACE_SIZE;
+        PointShadowArray arr = PointShadowTiers.tier(PointShadowTiers.tierOf(slot));
+        arr.bindFaceForRender(PointShadowTiers.localSlot(slot), face, toStatic);
+        int fs = arr.getFaceSize();
         GL11.glViewport(0, 0, fs, fs);
         GL11.glEnable(GL11.GL_SCISSOR_TEST);
         GL11.glScissor(0, 0, fs, fs);
@@ -911,7 +914,7 @@ public final class ShadowRenderer
         // The saved state is the original MC/Iris GL state, which every endPass
         // restores — so it is invariant across all passes of one bake. Snapshot
         // it only on the first pass (the glGet* are CPU<->GPU sync points; up to
-        // 16 spots + 16*6 point faces = ~112 passes would otherwise issue ~5
+        // 64 spots + 18*6 point faces = ~172 passes would otherwise issue ~5
         // each). beginBake() re-arms it for the next bake.
         inPass = true;
         if (passStateSaved)

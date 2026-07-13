@@ -14,6 +14,12 @@ import java.nio.ByteBuffer;
  * Cube-map-array of depth shadow maps, one cubemap (6 faces) per shadowed point
  * light. Face f of shadow slot i lives at array layer i*6 + f.
  *
+ * One INSTANCE per LOD tier, owned and handed out by {@link PointShadowTiers}
+ * (tier 0 = highest resolution; a single tier reproduces the legacy static
+ * layout exactly). Each instance owns its filter pair — a
+ * {@link PointShadowPyramid} and a {@link PointShadowEvsm} sized to this
+ * array's face size and slot count.
+ *
  * TWO layers: the LIVE array is what the shader samples; the STATIC array
  * holds a light's static-only content (model blocks + world blocks) so that
  * on frames with a dynamic caster the base can be restored with a single GPU
@@ -31,32 +37,74 @@ import java.nio.ByteBuffer;
  */
 public final class PointShadowArray
 {
-    /** Max point lights that get a cube shadow (cube-array is expensive). */
-    public static final int MAX_SHADOWS = 16;
-    public static int FACE_SIZE = 512;
-    public static final int LAYER_COUNT = 6 * MAX_SHADOWS;
-
     private static final int GL_TEXTURE_CUBE_MAP_SEAMLESS = 0x884F;
 
-    private static int glTextureId = 0;
-    private static int glFboId = 0;
-    private static boolean initialized = false;
+    /** Cube shadow slots in this tier (cube-array is expensive). */
+    private final int slotCount;
+    private int faceSize;
 
-    private static int staticTextureId = 0;
-    private static int staticFboId = 0;
-    private static boolean staticInitialized = false;
+    private int glTextureId = 0;
+    private int glFboId = 0;
+    private boolean initialized = false;
 
-    private PointShadowArray()
-    {}
+    private int staticTextureId = 0;
+    private int staticFboId = 0;
+    private boolean staticInitialized = false;
 
-    public static int getGlTextureId()
+    /** Min/max mip pyramid over this array's LIVE layer (sized with it). */
+    private final PointShadowPyramid pyramid;
+    /** MSM prefilter over this array's LIVE layer (sized with it). */
+    private final PointShadowEvsm evsm;
+
+    /** GL-free: all allocation stays lazy on first render/copy access. The
+     *  slot count is capped at 32 by the int dirty masks downstream
+     *  ({@link PointShadowPyramid}/{@link PointShadowEvsm}). */
+    public PointShadowArray(int slotCount, int initialFaceSize)
+    {
+        if (slotCount < 1 || slotCount > 32)
+        {
+            throw new IllegalArgumentException("PointShadowArray slotCount must be in 1..32: " + slotCount);
+        }
+        this.slotCount = slotCount;
+        this.faceSize = initialFaceSize;
+        this.pyramid = new PointShadowPyramid(this);
+        this.evsm = new PointShadowEvsm(this);
+    }
+
+    public int slotCount()
+    {
+        return slotCount;
+    }
+
+    public int getFaceSize()
+    {
+        return faceSize;
+    }
+
+    /** 6 cube faces per slot. */
+    public int layerCount()
+    {
+        return slotCount * 6;
+    }
+
+    public PointShadowPyramid pyramid()
+    {
+        return pyramid;
+    }
+
+    public PointShadowEvsm evsm()
+    {
+        return evsm;
+    }
+
+    public int getGlTextureId()
     {
         return glTextureId;
     }
 
     /** Bind the FBO of the requested layer (false = live, true = static) with
      *  the given cube face attached, allocating the layer on first use. */
-    public static void bindFaceForRender(int slot, int face, boolean staticLayer)
+    public void bindFaceForRender(int slot, int face, boolean staticLayer)
     {
         int fbo;
         int texture;
@@ -86,7 +134,7 @@ public final class PointShadowArray
     /** GPU-copy one slot's whole cube (all 6 faces in one call) from the
      *  static array into the live array — restores a light's static base
      *  before its dynamic casters are drawn on top. */
-    public static void copyStaticToLive(int slot)
+    public void copyStaticToLive(int slot)
     {
         if (!initialized)
         {
@@ -99,7 +147,7 @@ public final class PointShadowArray
         GL43.glCopyImageSubData(
             staticTextureId, GL40.GL_TEXTURE_CUBE_MAP_ARRAY, 0, 0, 0, slot * 6,
             glTextureId, GL40.GL_TEXTURE_CUBE_MAP_ARRAY, 0, 0, 0, slot * 6,
-            FACE_SIZE, FACE_SIZE, 6
+            faceSize, faceSize, 6
         );
     }
 
@@ -107,7 +155,7 @@ public final class PointShadowArray
      *  static array into the live array. The overlay path copies only the faces
      *  a dynamic caster touches this frame or touched last frame, instead of all
      *  6, when the static base itself is unchanged (see ShadowBaker T1.2). */
-    public static void copyStaticFaceToLive(int slot, int face)
+    public void copyStaticFaceToLive(int slot, int face)
     {
         if (!initialized)
         {
@@ -121,11 +169,11 @@ public final class PointShadowArray
         GL43.glCopyImageSubData(
             staticTextureId, GL40.GL_TEXTURE_CUBE_MAP_ARRAY, 0, 0, 0, layer,
             glTextureId, GL40.GL_TEXTURE_CUBE_MAP_ARRAY, 0, 0, 0, layer,
-            FACE_SIZE, FACE_SIZE, 1
+            faceSize, faceSize, 1
         );
     }
 
-    private static void init()
+    private void init()
     {
         int[] ids = createArray();
         glTextureId = ids[0];
@@ -133,7 +181,7 @@ public final class PointShadowArray
         initialized = true;
     }
 
-    private static void initStatic()
+    private void initStatic()
     {
         int[] ids = createArray();
         staticTextureId = ids[0];
@@ -143,7 +191,7 @@ public final class PointShadowArray
 
     /** Allocate one cube-map-array depth texture + FBO, every layer cleared to
      *  the far plane. Returns {textureId, fboId}; restores touched bindings. */
-    private static int[] createArray()
+    private int[] createArray()
     {
         int prevTex = GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D);
         int prevFbo = GL11.glGetInteger(GL30.GL_FRAMEBUFFER_BINDING);
@@ -154,7 +202,7 @@ public final class PointShadowArray
 
         GL12.glTexImage3D(
             GL40.GL_TEXTURE_CUBE_MAP_ARRAY, 0, GL30.GL_DEPTH_COMPONENT32F,
-            FACE_SIZE, FACE_SIZE, LAYER_COUNT, 0,
+            faceSize, faceSize, layerCount(), 0,
             GL11.GL_DEPTH_COMPONENT, GL11.GL_FLOAT, (ByteBuffer) null
         );
 
@@ -181,7 +229,7 @@ public final class PointShadowArray
             throw new IllegalStateException("PointShadowArray FBO incomplete: 0x" + Integer.toHexString(status));
         }
 
-        for (int layer = 0; layer < LAYER_COUNT; layer++)
+        for (int layer = 0; layer < layerCount(); layer++)
         {
             GL30.glFramebufferTextureLayer(GL30.GL_FRAMEBUFFER, GL30.GL_DEPTH_ATTACHMENT, textureId, 0, layer);
             GL11.glClearDepth(1.0);
@@ -196,10 +244,10 @@ public final class PointShadowArray
         return new int[] { textureId, fboId };
     }
 
-    public static void delete()
+    public void delete()
     {
-        PointShadowPyramid.delete(); // pyramid base size tracks the face size
-        PointShadowEvsm.delete();    // EVSM base size tracks the face size too
+        pyramid.delete(); // pyramid base size tracks the face size
+        evsm.delete();    // EVSM base size tracks the face size too
         if (initialized)
         {
             GL11.glDeleteTextures(glTextureId);
@@ -221,13 +269,13 @@ public final class PointShadowArray
     /** Switch per-face resolution; frees + re-inits both arrays on next access.
      *  MUST stay a power of two: PointShadowPyramid's and PointShadowEvsm's
      *  texel-center reads and their GLSL lod math (findMSB, shifts) rely on it. */
-    public static void setFaceSize(int newSize)
+    public void setFaceSize(int newSize)
     {
-        if (newSize == FACE_SIZE)
+        if (newSize == faceSize)
         {
             return;
         }
-        FACE_SIZE = newSize;
+        faceSize = newSize;
         delete();
     }
 }
