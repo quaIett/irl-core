@@ -181,14 +181,16 @@ public final class ShadowRenderer
     }
 
     /**
-     * Begin a point-cube face depth pass into the live or static array (see
+     * Begin a point-cube face depth pass into the live or static atlas (see
      * {@link #beginSpot} for the {@code toStatic}/{@code clear} semantics; the
-     * static base of a whole cube is restored by
-     * {@link PointShadowArray#copyStaticToLive}). {@code slot} is the GLOBAL
-     * tier-space slot (the value published to vlParams.w); it is resolved to
-     * the owning LOD tier's array + local cube layer here.
+     * static base of a whole block is restored by
+     * {@link PointDepthAtlas#copyStaticToLive}). {@code block} is the GLOBAL
+     * atlas block (the value published to vlParams.w); the face's pixel rect
+     * inside the flat atlas comes from the PointDepthAtlas accessors. The
+     * face switch below is the layout canon of
+     * {@link PointDepthAtlas#FACE_COL}/{@link PointDepthAtlas#FACE_ROW}.
      */
-    public static void beginPointFace(int slot, int face,
+    public static void beginPointFace(int block, int face,
                                       double lpx, double lpy, double lpz,
                                       float radius,
                                       boolean toStatic, boolean clear)
@@ -203,12 +205,13 @@ public final class ShadowRenderer
         float ey = (float) (lpy - currentOriginY);
         float ez = (float) (lpz - currentOriginZ);
 
-        PointShadowArray arr = PointShadowTiers.tier(PointShadowTiers.tierOf(slot));
-        arr.bindFaceForRender(PointShadowTiers.localSlot(slot), face, toStatic);
-        int fs = arr.getFaceSize();
-        GL11.glViewport(0, 0, fs, fs);
+        GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, PointDepthAtlas.getFboId(toStatic));
+        int px = PointDepthAtlas.facePixelX(block, face);
+        int py = PointDepthAtlas.facePixelY(block, face);
+        int ts = PointDepthAtlas.faceSizePx(block);
+        GL11.glViewport(px, py, ts, ts);
         GL11.glEnable(GL11.GL_SCISSOR_TEST);
-        GL11.glScissor(0, 0, fs, fs);
+        GL11.glScissor(px, py, ts, ts);
         if (clear)
         {
             GL11.glClearDepth(1.0);

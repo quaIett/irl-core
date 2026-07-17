@@ -186,7 +186,7 @@ public final class SpotShadowPyramid
                     // A sub-tile's chain ends at one texel per sub-tile — a
                     // deeper lod would mix neighbouring tiles. Full-size tiles
                     // (the whole degenerate layout) never hit this: levels =
-                    // log2(TILE_SIZE) already bottoms them out at one texel.
+                    // log2(tileSize) already bottoms them out at one texel.
                     continue;
                 }
                 GL20.glUniform2i(uSrcOrigin, pixX >> lod, pixY >> lod);
@@ -246,8 +246,8 @@ public final class SpotShadowPyramid
         int prevTex = GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D);
         texId = GlStateManager._genTexture();
         GlStateManager._bindTexture(texId);
-        // base = atlas/2; levels = log2(TILE_SIZE): the deepest lod is one texel per tile — deeper would mix tiles
-        levels = Integer.numberOfTrailingZeros(Integer.highestOneBit(SpotlightDepthAtlas.TILE_SIZE));
+        // base = atlas/2; levels = log2(tileSize): the deepest lod is one texel per tile — deeper would mix tiles
+        levels = Integer.numberOfTrailingZeros(Integer.highestOneBit(SpotlightDepthAtlas.getTileSize()));
         GL42.glTexStorage2D(GL11.GL_TEXTURE_2D, levels, GL30.GL_RG32F,
             SpotlightDepthAtlas.getAtlasWidth() / 2, SpotlightDepthAtlas.getAtlasHeight() / 2);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);

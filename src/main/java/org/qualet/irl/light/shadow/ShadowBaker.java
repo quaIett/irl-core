@@ -166,8 +166,8 @@ public final class ShadowBaker
     private static final int STALE_FRAMES = 2;
     private static final long[] spotTileOwner = new long[SpotlightDepthAtlas.tileCount()];
     private static final int[] spotTileActive = new int[SpotlightDepthAtlas.tileCount()];
-    private static final long[] pointSlotOwner = new long[PointShadowTiers.totalSlots()];
-    private static final int[] pointSlotActive = new int[PointShadowTiers.totalSlots()];
+    private static final long[] pointSlotOwner = new long[PointDepthAtlas.blockCount()];
+    private static final int[] pointSlotActive = new int[PointDepthAtlas.blockCount()];
 
     // --- LOD tier assignment (I3) ---------------------------------------------
     // Exclusive END of each tier's range in the type's FLAT pool index space
@@ -193,7 +193,11 @@ public final class ShadowBaker
     private static final int DEMOTE_MARGIN = 2;
     /** Cap on CONSECUTIVE frames a demoted light may keep publishing (and
      *  active-refreshing) its old tile after {@link #acquireTileTiered} finds
-     *  every fallback tier full. While holding, the light keeps a valid shadow
+     *  every fallback tier full, and — same shared counter — on the frames a
+     *  light is Schmitt-held past the WHOLE pool (raw tier NONE): past the cap
+     *  such a light degrades to the spare-capacity path (age-edge stamp, see
+     *  {@link #acquireSpareTile}) instead of pinning its slot at full
+     *  strength. While holding, the light keeps a valid shadow
      *  (no blink) at a stale tier; past the cap it stops publishing AND
      *  refreshing, so the tile ages out exactly like a culled light's and real
      *  pool pressure re-sorts ownership back to rank order — without the cap a
@@ -201,11 +205,13 @@ public final class ShadowBaker
      *  light pinning a tier-0 tile forever). Saturation-case inversion bound =
      *  cap + {@link #STALE_FRAMES} + bake latency (~12 frames); the
      *  uncontended case stays rank-bounded by {@link #DEMOTE_MARGIN}. The
-     *  counter re-arms only on a successful acquire (an expired hold cannot
+     *  counter re-arms only on a successful IN-POOL acquire — rank back inside
+     *  the pool (an expired hold cannot
      *  re-arm itself by rank oscillation). KNOWN ACCEPTED LIMITS: the count is
-     *  of all-fail frames only, so (a) frames spent in other branches
-     *  (TIER_NONE, culled) pause rather than reset it — a resumed hold is
-     *  SHORTER, never longer; (b) a mixed regime alternating all-fail with
+     *  of slot-pinning frames only (all-fail acquire holds and Schmitt-held
+     *  past-pool frames share it), so (a) frames spent in branches that pin
+     *  nothing (behind-culled in-pool owners, spare-mode frames) pause rather
+     *  than reset it — a resumed hold is SHORTER, never longer; (b) a mixed regime alternating all-fail with
      *  acquire-success-whose-bake-is-budget-refused re-arms it and can extend
      *  the inversion — reachable only under sustained mandatory-budget
      *  starvation plus per-frame tile churn (C1 hysteresis + Schmitt + sticky
@@ -216,6 +222,15 @@ public final class ShadowBaker
      *  {@link #CONTENTION_HOLD_FRAMES}); lifecycle follows the dirty-state
      *  maps (purge on steal, retain sweep, reset). */
     private static final Long2IntOpenHashMap contentionHold = new Long2IntOpenHashMap();
+
+    /** Per-light contention-hold cap: {@link #CONTENTION_HOLD_FRAMES} plus a
+     *  0-3 frame id-keyed jitter, so a batch of lights displaced together (one
+     *  camera move) doesn't expire its holds — and pay the resulting steal +
+     *  FORCED re-bake — in one synchronized frame hitch. */
+    private static int holdCap(long id)
+    {
+        return CONTENTION_HOLD_FRAMES + (int) (id & 3L);
+    }
     /** Monotonic bake counter driving the staleness test (not wall time). */
     private static int frameIndex;
     /** Remaining DEFERRABLE full static bakes this frame (T2.4). Reset each frame
@@ -254,10 +269,10 @@ public final class ShadowBaker
         {
             SPOT_TIER_END[t] = SpotlightDepthAtlas.tierStartTile(t) + SpotlightDepthAtlas.tierTileCount(t);
         }
-        POINT_TIER_END = new int[PointShadowTiers.tierCount()];
+        POINT_TIER_END = new int[3];
         for (int t = 0; t < POINT_TIER_END.length; t++)
         {
-            POINT_TIER_END[t] = PointShadowTiers.tierBase(t) + PointShadowTiers.tier(t).slotCount();
+            POINT_TIER_END[t] = PointDepthAtlas.tierStartBlock(t) + PointDepthAtlas.tierBlockCount(t);
         }
     }
 
@@ -280,6 +295,13 @@ public final class ShadowBaker
     /** Overlay frames (static base copied / cleared + dynamic casters drawn). */
     private static int profSpotOverlays;
     private static int profPointOverlays;
+    /** Peak one-frame tile demand (ranks consumed, behind-culled included) in
+     *  the window — compare against the pool sizes printed next to it. */
+    private static int profSpotDemand;
+    private static int profPointDemand;
+    /** Peak one-frame behind-camera-culled light count in the window. */
+    private static int profSpotBehind;
+    private static int profPointBehind;
     /** Reusable scratch set of all current light ids, used to evict the block-
      *  list + VBO caches for lights that disappeared. */
     private static final LongOpenHashSet liveIds = new LongOpenHashSet();
@@ -356,9 +378,15 @@ public final class ShadowBaker
         // Behind-camera cull inputs: a light whose whole influence sphere is
         // behind the camera plane lights no on-screen surface (diffuse/specular
         // only sample its shadow map for in-range fragments, and volumetrics
-        // ignore the map), so its bake is skipped entirely (the per-light test
-        // in each loop below). Conservative: only the fully-behind half-space is
+        // ignore the map), so its bake work is skipped (the per-light test in
+        // each loop below). Conservative: only the fully-behind half-space is
         // culled, never a side-of-frustum light, so no shadow can go missing.
+        // The cull does NOT skip rank consumption (I3): rank must be a pure
+        // function of camera POSITION (C1 distance order), never of view
+        // DIRECTION — when it did, a rotation that culled half a lamp field
+        // shifted every remaining light's rank across the tier/pool boundaries,
+        // and once demand exceeded the pool the shadows visibly jumped between
+        // sources on every camera pan.
         double camX = cameraPos.x, camY = cameraPos.y, camZ = cameraPos.z;
         boolean haveFwd = cameraForward != null;
         double fwdX = haveFwd ? cameraForward.x : 0.0;
@@ -370,9 +398,11 @@ public final class ShadowBaker
         // to the highest-priority lights first. Tiles are sticky per id, so the
         // reordering never re-bakes an otherwise-unchanged light.
         // I3: spotRank counts this frame's spot TILE REQUESTS (0-based, C1
-        // order) — a light consumes a rank only after passing every skip
-        // check; the rank picks its desired LOD tier.
+        // order) — a light consumes a rank only after passing every
+        // CAMERA-INDEPENDENT skip check (the behind-camera cull consumes a
+        // rank too, see the cull-inputs note); the rank picks its LOD tier.
         int spotRank = 0;
+        int behindSpots = 0;
         for (int k = 0; k < n; k++)
         {
             int i = LightRegistry.orderedIndex(k);
@@ -394,14 +424,12 @@ public final class ShadowBaker
             {
                 continue;
             }
-            // Whole sphere behind the camera -> skip. Its SSBO tile stays -1
-            // (unshadowed, never sampled) while off; the sticky tile it owns is
-            // kept, so when the camera turns back an unchanged light re-uses
-            // its old map without any rebake.
-            if (haveFwd && (lx - camX) * fwdX + (ly - camY) * fwdY + (lz - camZ) * fwdZ < -range)
-            {
-                continue;
-            }
+            // Whole sphere behind the camera -> the bake work is skipped below,
+            // AFTER this light consumes its rank (see the cull-inputs note). Its
+            // SSBO tile stays -1 (unshadowed, never sampled) while off; the
+            // sticky tile it owns is kept alive, so when the camera turns back
+            // an unchanged light re-uses its old map without any rebake.
+            boolean behind = haveFwd && (lx - camX) * fwdX + (ly - camY) * fwdY + (lz - camZ) * fwdZ < -range;
             boolean castsShadows = LightRegistry.getShadows(i);
             long id = LightRegistry.getId(i);
 
@@ -430,56 +458,125 @@ public final class ShadowBaker
             // decision must match the frame that actually baked, or the atlas
             // tile a light points to in the SSBO could drift off its baked
             // depth map. Cached by id -> O(1) on a hit, and the returned list
-            // instance is stable until a block in range changes.
-            List<BlockShadowEntry> blocks = castsShadows ? collectBlocks(id, world, lx, ly, lz, range) : Collections.emptyList();
+            // instance is stable until a block in range changes. A BEHIND
+            // light only reads blocks in the skip check below, which
+            // short-circuits on entInRange > 0 — skip the collect there
+            // (rank-neutral: the skip outcome is identical either way), so a
+            // moving culled light doesn't pay per-cell block re-collects.
+            List<BlockShadowEntry> blocks = castsShadows && (!behind || entInRange == 0)
+                ? collectBlocks(id, world, lx, ly, lz, range) : Collections.emptyList();
             if (entInRange == 0 && blocks.isEmpty())
             {
                 continue;
             }
 
-            // I3 tier assignment: every skip check passed -> consume one rank.
+            // I3 tier assignment: every camera-independent skip check passed ->
+            // consume one rank (behind-culled lights included, see above).
             int rank = spotRank++;
             int prevTile = ownedPrevTile(spotTileOwner, id);
             int lastTier = prevTile >= 0 ? tierForIndex(prevTile, SPOT_TIER_END) : TIER_NONE;
             int desired = desiredTier(rank, lastTier, SPOT_TIER_END);
-            if (desired == TIER_NONE)
+            boolean pastPool = tierForIndex(rank, SPOT_TIER_END) == TIER_NONE;
+            if (pastPool && desired != TIER_NONE)
             {
-                // Ranked past the last tier: unshadowed this frame (SSBO tile
-                // stays -1, never sampled). Ownership is NOT purged — it ages
-                // out via the stale-steal path naturally, so a light hovering
-                // at the capacity edge doesn't first-bake on every return.
-                continue;
-            }
-            int myTile = acquireTileTiered(spotTileOwner, spotTileActive, id, desired, SPOT_TIER_END);
-            if (myTile < 0)
-            {
-                // Every tile of every fallback tier is owned by a recently-
-                // active light. A light that still OWNS a valid map (only
-                // reachable on an accepted demote — hold/promote would have
-                // owner-matched it in the scan) keeps sampling it instead of
-                // going unshadowed (leaking through walls), handoff-style:
-                // publish the owned tile + refresh its active stamp so it
-                // can't be stale-stolen mid-use. The hold is BOUNDED
-                // (CONTENTION_HOLD_FRAMES consecutive failures): past the cap
-                // the light neither publishes nor refreshes, so the tile ages
-                // exactly like a culled light's — no foreign-w window, nothing
-                // is published on any frame the tile could be stolen — and
-                // sustained saturation re-sorts the pool to true rank order
-                // instead of freezing the inversion. Tile-less lights stay
-                // unshadowed (-1), exactly like the old full single pool.
-                if (prevTile >= 0)
+                // Schmitt-held past the WHOLE pool: the light pins a slot it
+                // no longer ranks for, and with rotation-stable ranks + the
+                // behind keep-alive below nothing else would ever re-sort a
+                // static shot — so the pin is bounded in TIME by the shared
+                // contention counter (ticking visible AND behind: it is the
+                // slot-pinning being bounded, not a publish). Past the cap the
+                // light degrades to the spare path below; an in-pool acquire
+                // (rank back inside) re-arms the counter.
+                int held = (contentionHold.containsKey(id) ? contentionHold.get(id) : 0) + 1;
+                if (held <= holdCap(id))
                 {
-                    int held = (contentionHold.containsKey(id) ? contentionHold.get(id) : 0) + 1;
-                    if (held <= CONTENTION_HOLD_FRAMES)
-                    {
-                        contentionHold.put(id, held);
-                        LightRegistry.setShadowTile(i, prevTile);
-                        spotTileActive[prevTile] = frameIndex;
-                    }
+                    contentionHold.put(id, held);
+                }
+                else
+                {
+                    desired = TIER_NONE;
+                }
+            }
+            if (behind)
+            {
+                // Culled: no bake, no publish (no on-screen fragment samples
+                // this light, SSBO tile stays -1). The owned tile's stamp is
+                // kept fresh only while the light still ranks for the tier it
+                // holds (desired <= lastTier = the Schmitt hold and pending
+                // promotes; a light demoted past the margin — or past the
+                // bounded past-pool hold above — stops refreshing, so a
+                // too-good tile ages out and re-sorts to a light that ranks
+                // for it). A pan over an in-pool owner therefore steals
+                // nothing, and the turn-back re-uses the old map bake-free.
+                behindSpots++;
+                if (prevTile >= 0 && desired != TIER_NONE && desired <= lastTier)
+                {
+                    spotTileActive[prevTile] = frameIndex;
                 }
                 continue;
             }
-            contentionHold.remove(id); // successful acquire re-arms the saturation hold
+            int myTile;
+            if (desired == TIER_NONE)
+            {
+                // Ranked past the pool (or past the bounded Schmitt hold):
+                // SPARE-CAPACITY mode instead of an instant shadow drop.
+                // Re-take the still-owned tile, else a free / long-dead slot —
+                // never a live steal — stamped active = frameIndex - 1:
+                // permanently on the staleness edge, so any in-pool light with
+                // a real claim (they all iterate earlier and observe age >=
+                // STALE_FRAMES) steals it the moment demand exists. Spare
+                // usage costs the rank re-sort nothing, and a shadow now dies
+                // only when its slot is actually taken — not the frame the
+                // rank crosses the pool edge. Publishing is safe: the slot is
+                // owned, so the normal path below either re-uses our own valid
+                // map or first-bakes (mandatory-gated, SHADOW_PENDING on
+                // refusal) before anything samples it.
+                myTile = acquireSpareTile(spotTileOwner, spotTileActive, id, SPOT_TIER_END);
+                if (myTile < 0)
+                {
+                    continue; // nothing owned, free or reclaimable: unshadowed (tile -1)
+                }
+            }
+            else
+            {
+                myTile = acquireTileTiered(spotTileOwner, spotTileActive, id, desired, SPOT_TIER_END);
+                if (myTile < 0)
+                {
+                    // Every tile of every fallback tier is owned by a recently-
+                    // active light. A light that still OWNS a valid map (only
+                    // reachable on an accepted demote — hold/promote would have
+                    // owner-matched it in the scan) keeps sampling it instead of
+                    // going unshadowed (leaking through walls), handoff-style:
+                    // publish the owned tile + refresh its active stamp so it
+                    // can't be stale-stolen mid-use (an unrefreshed published
+                    // tile could be stale-stolen and re-baked THIS frame by a
+                    // later-iterating light -> foreign-w; refreshed it is age 0,
+                    // and later lights only owner-match their own tiles, take
+                    // free slots or steal STALE ones). The hold is BOUNDED
+                    // (CONTENTION_HOLD_FRAMES consecutive failures): past the cap
+                    // the light neither publishes nor refreshes, so the tile ages
+                    // out — no foreign-w window, nothing
+                    // is published on any frame the tile could be stolen — and
+                    // sustained saturation re-sorts the pool to true rank order
+                    // instead of freezing the inversion. Tile-less lights stay
+                    // unshadowed (-1), exactly like the old full single pool.
+                    if (prevTile >= 0)
+                    {
+                        int held = (contentionHold.containsKey(id) ? contentionHold.get(id) : 0) + 1;
+                        if (held <= holdCap(id))
+                        {
+                            contentionHold.put(id, held);
+                            LightRegistry.setShadowTile(i, prevTile);
+                            spotTileActive[prevTile] = frameIndex;
+                        }
+                    }
+                    continue;
+                }
+                if (!pastPool)
+                {
+                    contentionHold.remove(id); // successful in-pool acquire re-arms the saturation hold
+                }
+            }
             long sig = lightGeomSig(lx, ly, lz, dx, dy, dz, range, cosOuter, castsShadows) + staticOccSigScratch;
             sig ^= staticInRangeScratch * STATIC_COUNT_MIX; // fold static count (INVARIANT 3); 0 on redactor
             boolean dyn = dynamicInRangeScratch;
@@ -713,10 +810,11 @@ public final class ShadowBaker
         // keeps its own map, so sharing it costs a staler shadow, never a leak).
         mandatoryBakeBudget = budget <= 0 ? Integer.MAX_VALUE : Math.max(1, budget);
 
-        // --- point lights: cube-array, 6 faces each ---
+        // --- point lights: flat atlas, one 6-face block each ---
         // Priority order, sticky tiles (see the spot loop). pointRank is the
         // point-type twin of spotRank (I3 tier assignment).
         int pointRank = 0;
+        int behindPoints = 0;
         for (int k = 0; k < n; k++)
         {
             int i = LightRegistry.orderedIndex(k);
@@ -736,11 +834,9 @@ public final class ShadowBaker
             {
                 continue;
             }
-            // Behind-camera cull (see the spot loop).
-            if (haveFwd && (lx - camX) * fwdX + (ly - camY) * fwdY + (lz - camZ) * fwdZ < -radius)
-            {
-                continue;
-            }
+            // Behind-camera cull (see the spot loop): bake work only — the
+            // rank is still consumed below.
+            boolean behind = haveFwd && (lx - camX) * fwdX + (ly - camY) * fwdY + (lz - camZ) * fwdZ < -radius;
             boolean castsShadows = LightRegistry.getShadows(i);
             long id = LightRegistry.getId(i);
 
@@ -748,52 +844,97 @@ public final class ShadowBaker
             // Points are omnidirectional -> no cone cull (cone=false); the 6 cube
             // faces are culled individually in renderInRangeFace below.
             int entInRange = castsShadows ? scanInRange(lx, ly, lz, radius, 0f, 0f, 0f, 0f, false) : 0;
-            // Collected once, reused across all 6 cube faces (see spot note).
-            List<BlockShadowEntry> blocks = castsShadows ? collectBlocks(id, world, lx, ly, lz, radius) : Collections.emptyList();
+            // Collected once, reused across all 6 cube faces (see spot note);
+            // behind lights skip the collect when entInRange already decides
+            // the skip check (rank-neutral, see the spot loop).
+            List<BlockShadowEntry> blocks = castsShadows && (!behind || entInRange == 0)
+                ? collectBlocks(id, world, lx, ly, lz, radius) : Collections.emptyList();
             if (entInRange == 0 && blocks.isEmpty())
             {
                 continue;
             }
 
-            // I3 tier assignment (see the spot loop): every skip check passed
-            // -> consume one rank, Schmitt-pick the tier, acquire with fallback.
+            // I3 tier assignment (see the spot loop): every camera-independent
+            // skip check passed -> consume one rank (behind-culled included),
+            // Schmitt-pick the tier, acquire with fallback.
             int rank = pointRank++;
             int prevTile = ownedPrevTile(pointSlotOwner, id);
             int lastTier = prevTile >= 0 ? tierForIndex(prevTile, POINT_TIER_END) : TIER_NONE;
             int desired = desiredTier(rank, lastTier, POINT_TIER_END);
-            if (desired == TIER_NONE)
+            boolean pastPool = tierForIndex(rank, POINT_TIER_END) == TIER_NONE;
+            if (pastPool && desired != TIER_NONE)
             {
-                continue; // ranked past the last tier: unshadowed; ownership ages out via stale-steal
-            }
-            int myLayer = acquireTileTiered(pointSlotOwner, pointSlotActive, id, desired, POINT_TIER_END);
-            if (myLayer < 0)
-            {
-                // Every slot of every fallback tier owned by a recently-active
-                // light: keep sampling a still-owned valid cube handoff-style
-                // rather than leaking unshadowed — BOUNDED to
-                // CONTENTION_HOLD_FRAMES like the spot loop (see there).
-                if (prevTile >= 0)
+                // Schmitt-held past the WHOLE pool: bounded in TIME by the
+                // shared contention counter — see the spot loop.
+                int held = (contentionHold.containsKey(id) ? contentionHold.get(id) : 0) + 1;
+                if (held <= holdCap(id))
                 {
-                    int held = (contentionHold.containsKey(id) ? contentionHold.get(id) : 0) + 1;
-                    if (held <= CONTENTION_HOLD_FRAMES)
-                    {
-                        contentionHold.put(id, held);
-                        LightRegistry.setShadowTile(i, prevTile);
-                        pointSlotActive[prevTile] = frameIndex;
-                    }
+                    contentionHold.put(id, held);
+                }
+                else
+                {
+                    desired = TIER_NONE;
+                }
+            }
+            if (behind)
+            {
+                // Culled keep-alive: no bake, no publish; stamp refreshed only
+                // while the light still ranks for the tier it holds — see the
+                // spot loop.
+                behindPoints++;
+                if (prevTile >= 0 && desired != TIER_NONE && desired <= lastTier)
+                {
+                    pointSlotActive[prevTile] = frameIndex;
                 }
                 continue;
             }
-            contentionHold.remove(id); // successful acquire re-arms the saturation hold
-            // myLayer is a GLOBAL slot (what vlParams.w carries); the per-tier
-            // textures address their cubes by (tier instance, LOCAL layer).
-            PointShadowArray myArr = PointShadowTiers.tier(PointShadowTiers.tierOf(myLayer));
-            int myLocal = PointShadowTiers.localSlot(myLayer);
+            int myBlock;
+            if (desired == TIER_NONE)
+            {
+                // Ranked past the pool (or past the bounded Schmitt hold):
+                // SPARE-CAPACITY mode, age-edge stamp — see the spot loop's
+                // TIER_NONE note. The shadow dies only when the slot is
+                // actually taken by an in-pool light, not at the rank edge.
+                myBlock = acquireSpareTile(pointSlotOwner, pointSlotActive, id, POINT_TIER_END);
+                if (myBlock < 0)
+                {
+                    continue; // nothing owned, free or reclaimable: unshadowed (tile -1)
+                }
+            }
+            else
+            {
+                myBlock = acquireTileTiered(pointSlotOwner, pointSlotActive, id, desired, POINT_TIER_END);
+                if (myBlock < 0)
+                {
+                    // Every slot of every fallback tier owned by a recently-active
+                    // light: keep sampling a still-owned valid cube handoff-style
+                    // rather than leaking unshadowed — BOUNDED to
+                    // CONTENTION_HOLD_FRAMES like the spot loop (see there).
+                    if (prevTile >= 0)
+                    {
+                        int held = (contentionHold.containsKey(id) ? contentionHold.get(id) : 0) + 1;
+                        if (held <= holdCap(id))
+                        {
+                            contentionHold.put(id, held);
+                            LightRegistry.setShadowTile(i, prevTile);
+                            pointSlotActive[prevTile] = frameIndex;
+                        }
+                    }
+                    continue;
+                }
+                if (!pastPool)
+                {
+                    contentionHold.remove(id); // successful in-pool acquire re-arms the saturation hold
+                }
+            }
+            // myBlock is the GLOBAL atlas block (what vlParams.w carries); the
+            // per-tier filter textures address their layers by the LOCAL block
+            // (myBlock - tierStartBlock), resolved inside their flushDirty.
             long sig = lightGeomSig(lx, ly, lz, 0f, 0f, 0f, radius, 1f, castsShadows) + staticOccSigScratch;
             sig ^= staticInRangeScratch * STATIC_COUNT_MIX; // fold static count (INVARIANT 3); 0 on redactor
             boolean dyn = dynamicInRangeScratch;
             boolean hasStatic = staticInRangeScratch > 0 || !blocks.isEmpty();
-            LightRegistry.setShadowTile(i, myLayer);
+            LightRegistry.setShadowTile(i, myBlock);
 
             if (!cache)
             {
@@ -804,7 +945,7 @@ public final class ShadowBaker
                 }
                 for (int face = 0; face < 6; face++)
                 {
-                    ShadowRenderer.beginPointFace(myLayer, face, lxD, lyD, lzD, radius, false, true);
+                    ShadowRenderer.beginPointFace(myBlock, face, lxD, lyD, lzD, radius, false, true);
                     if (entInRange > 0)
                     {
                         renderInRangeFace(face, CASTERS_ALL, tickDelta);
@@ -815,10 +956,10 @@ public final class ShadowBaker
                     }
                     ShadowRenderer.endPass();
                 }
-                myArr.pyramid().markDirty(myLocal);
-                myArr.evsm().markDirty(myLocal, radius);
-                rememberLive(id, sig, myLayer, blocks, dyn);
-                releaseOldTile(pointSlotOwner, id, prevTile, myLayer); // bake succeeded into myLayer -> free the old tier's slot
+                PointShadowPyramid.markDirty(myBlock);
+                PointShadowEvsm.markDirty(myBlock, radius);
+                rememberLive(id, sig, myBlock, blocks, dyn);
+                releaseOldTile(pointSlotOwner, id, prevTile, myBlock); // bake succeeded into myBlock -> free the old tier's block
                 continue;
             }
 
@@ -828,13 +969,13 @@ public final class ShadowBaker
                 boolean dirty = !lastTile.containsKey(id)
                     || lastSig.get(id) != sig
                     || lastBlocks.get(id) != blocks
-                    || lastTile.get(id) != myLayer;
+                    || lastTile.get(id) != myBlock;
                 if (dirty)
                 {
                     // First bake / tile reassigned: throttled by the mandatory
                     // budget (C2), not freely deferrable (T2.4); a refusal marks it
                     // shadow-pending below (flush omits it, see the spot loop).
-                    boolean mustBake = !lastTile.containsKey(id) || lastTile.get(id) != myLayer;
+                    boolean mustBake = !lastTile.containsKey(id) || lastTile.get(id) != myBlock;
                     if (allowStaticBake(mustBake ? BAKE_MANDATORY : BAKE_DEFERRABLE))
                     {
                         if (PROFILE)
@@ -843,7 +984,7 @@ public final class ShadowBaker
                         }
                         for (int face = 0; face < 6; face++)
                         {
-                            ShadowRenderer.beginPointFace(myLayer, face, lxD, lyD, lzD, radius, false, true);
+                            ShadowRenderer.beginPointFace(myBlock, face, lxD, lyD, lzD, radius, false, true);
                             if (staticInRangeScratch > 0)
                             {
                                 renderInRangeFace(face, CASTERS_STATIC, tickDelta);
@@ -854,14 +995,14 @@ public final class ShadowBaker
                             }
                             ShadowRenderer.endPass();
                         }
-                        myArr.pyramid().markDirty(myLocal);
-                        myArr.evsm().markDirty(myLocal, radius);
-                        rememberLive(id, sig, myLayer, blocks, false);
-                        releaseOldTile(pointSlotOwner, id, prevTile, myLayer); // tier flip completed -> free the old slot
+                        PointShadowPyramid.markDirty(myBlock);
+                        PointShadowEvsm.markDirty(myBlock, radius);
+                        rememberLive(id, sig, myBlock, blocks, false);
+                        releaseOldTile(pointSlotOwner, id, prevTile, myBlock); // tier flip completed -> free the old block
                     }
                     else if (mustBake)
                     {
-                        if (prevTile >= 0 && prevTile != myLayer)
+                        if (prevTile >= 0 && prevTile != myBlock)
                         {
                             // HANDOFF (I3, zero-blink tier flip): keep sampling
                             // the old, still-owned, still-valid cube while the
@@ -877,7 +1018,7 @@ public final class ShadowBaker
                             // the spot handoff: kept, it would strand in dual
                             // ownership, go stale, and its steal would purge
                             // this light's dirty state mid-handoff.
-                            pointSlotOwner[myLayer] = NO_OWNER;
+                            pointSlotOwner[myBlock] = NO_OWNER;
                         }
                         else
                         {
@@ -893,30 +1034,30 @@ public final class ShadowBaker
                     }
                     // else deferrable re-bake deferred: keep our own (older) live
                     // cube; dirty state unchanged so it retries next frame
-                    // (SSBO -> myLayer).
+                    // (SSBO -> myBlock).
                 }
                 else
                 {
-                    rememberLive(id, sig, myLayer, blocks, false);
+                    rememberLive(id, sig, myBlock, blocks, false);
                 }
                 continue;
             }
 
             // Overlay mode (see the spot loop). The static base lives in the
-            // STATIC cube, re-baked only when it changes; each frame it is
-            // GPU-copied into the live cube and only the dynamic casters redraw,
-            // into the faces their spheres actually touch.
+            // STATIC atlas layer, re-baked only when it changes; each frame it
+            // is GPU-copied into the live block and only the dynamic casters
+            // redraw, into the faces their spheres actually touch.
             if (hasStatic)
             {
                 boolean staticStale = !lastStaticTile.containsKey(id)
                     || lastStaticSig.get(id) != sig
                     || lastStaticBlocks.get(id) != blocks
-                    || lastStaticTile.get(id) != myLayer;
+                    || lastStaticTile.get(id) != myBlock;
                 // Deferrable only while a dynamic subject is present and we own a
-                // prior static cube to fall back on (see the spot overlay note).
+                // prior static base to fall back on (see the spot overlay note).
                 boolean staticMustBake = !dyn
                     || !lastStaticTile.containsKey(id)
-                    || lastStaticTile.get(id) != myLayer;
+                    || lastStaticTile.get(id) != myBlock;
                 boolean bakedStatic = false;
                 // Must-bake here is FORCED (no valid base for the copy, or a leave
                 // transition) — never throttled; the deferrable case still honours
@@ -930,7 +1071,7 @@ public final class ShadowBaker
                     }
                     for (int face = 0; face < 6; face++)
                     {
-                        ShadowRenderer.beginPointFace(myLayer, face, lxD, lyD, lzD, radius, true, true);
+                        ShadowRenderer.beginPointFace(myBlock, face, lxD, lyD, lzD, radius, true, true);
                         if (staticInRangeScratch > 0)
                         {
                             renderInRangeFace(face, CASTERS_STATIC, tickDelta);
@@ -942,28 +1083,28 @@ public final class ShadowBaker
                         ShadowRenderer.endPass();
                     }
                     lastStaticSig.put(id, sig);
-                    lastStaticTile.put(id, myLayer);
+                    lastStaticTile.put(id, myBlock);
                     lastStaticBlocks.put(id, blocks);
-                    // Slot change in overlay mode forces this bake (staticMustBake
+                    // Block change in overlay mode forces this bake (staticMustBake
                     // -> BAKE_FORCED), completing the handoff (see the spot loop).
-                    releaseOldTile(pointSlotOwner, id, prevTile, myLayer);
+                    releaseOldTile(pointSlotOwner, id, prevTile, myBlock);
                 }
 
-                // Restore the static base into the live cube (T1.2). When the
+                // Restore the static base into the live block (T1.2). When the
                 // static layer was just re-baked (bakedStatic) every live face
-                // needs the new base, so blit all 6 in one call — this also
-                // covers first-overlay and post-tile-steal (both force a bake via
-                // an absent / purged lastStaticTile). Otherwise copy only the
-                // faces that need it: the ones a dynamic caster touches now
-                // (dynNow) OR touched last frame (lastFaceDynamic, so a vacated
-                // face restores to static instead of keeping its stale
+                // needs the new base, so blit the whole block in one call — this
+                // also covers first-overlay and post-tile-steal (both force a
+                // bake via an absent / purged lastStaticTile). Otherwise copy
+                // only the faces that need it: the ones a dynamic caster touches
+                // now (dynNow) OR touched last frame (lastFaceDynamic, so a
+                // vacated face restores to static instead of keeping its stale
                 // silhouette). Untouched faces already hold the static base —
                 // including when a stale re-bake was DEFERRED (T2.4): the static
-                // cube is unchanged, so the live cube's static faces still match.
+                // layer is unchanged, so the live block's static faces still match.
                 int dynNow = dynFaceMaskScratch;
                 if (bakedStatic)
                 {
-                    myArr.copyStaticToLive(myLocal);
+                    PointDepthAtlas.copyStaticToLive(myBlock);
                 }
                 else
                 {
@@ -972,7 +1113,7 @@ public final class ShadowBaker
                     {
                         if ((copyMask & (1 << face)) != 0)
                         {
-                            myArr.copyStaticFaceToLive(myLocal, face);
+                            PointDepthAtlas.copyStaticFaceToLive(myBlock, face);
                         }
                     }
                 }
@@ -989,7 +1130,7 @@ public final class ShadowBaker
                         {
                             continue; // no dynamic caster reaches this face; the copy refreshed it
                         }
-                        ShadowRenderer.beginPointFace(myLayer, face, lxD, lyD, lzD, radius, false, false);
+                        ShadowRenderer.beginPointFace(myBlock, face, lxD, lyD, lzD, radius, false, false);
                         renderInRangeFace(face, CASTERS_DYNAMIC, tickDelta);
                         ShadowRenderer.endPass();
                     }
@@ -1006,7 +1147,7 @@ public final class ShadowBaker
                 }
                 for (int face = 0; face < 6; face++)
                 {
-                    ShadowRenderer.beginPointFace(myLayer, face, lxD, lyD, lzD, radius, false, true);
+                    ShadowRenderer.beginPointFace(myBlock, face, lxD, lyD, lzD, radius, false, true);
                     if (dyn)
                     {
                         renderInRangeFace(face, CASTERS_DYNAMIC, tickDelta);
@@ -1014,32 +1155,37 @@ public final class ShadowBaker
                     ShadowRenderer.endPass();
                 }
                 // All 6 live faces fully rewritten (clear + dynamics), i.e. a
-                // successful bake into myLayer -> same release rule as above.
-                releaseOldTile(pointSlotOwner, id, prevTile, myLayer);
+                // successful bake into myBlock -> same release rule as above.
+                releaseOldTile(pointSlotOwner, id, prevTile, myBlock);
             }
             // overlay mode rewrites live faces every frame (copies + dynamics) -> pyramid + EVSM follow every frame
-            myArr.pyramid().markDirty(myLocal);
-            myArr.evsm().markDirty(myLocal, radius);
+            PointShadowPyramid.markDirty(myBlock);
+            PointShadowEvsm.markDirty(myBlock, radius);
 
             if (dyn)
             {
                 wasDynamic.add(id);
-                // Keep the live-slot record current through overlay frames —
+                // Keep the live-block record current through overlay frames —
                 // see the spot loop tail: preserves the Schmitt hysteresis
                 // across tier flips and for dyn-from-birth lights (I3).
-                lastTile.put(id, myLayer);
+                lastTile.put(id, myBlock);
             }
             else
             {
-                rememberLive(id, sig, myLayer, blocks, false);
+                rememberLive(id, sig, myBlock, blocks, false);
             }
         }
 
-        // one batched pyramid + EVSM pass over every slot the point loop dirtied (before the SSBO flush / Iris passes)
-        for (int t = 0; t < PointShadowTiers.tierCount(); t++)
+        // one batched pyramid + EVSM pass over every block the point loop dirtied (before the SSBO flush / Iris passes)
+        PointShadowPyramid.flushDirty();
+        PointShadowEvsm.flushDirty();
+
+        if (PROFILE)
         {
-            PointShadowTiers.tier(t).pyramid().flushDirty();
-            PointShadowTiers.tier(t).evsm().flushDirty();
+            profSpotDemand = Math.max(profSpotDemand, spotRank);
+            profPointDemand = Math.max(profPointDemand, pointRank);
+            profSpotBehind = Math.max(profSpotBehind, behindSpots);
+            profPointBehind = Math.max(profPointBehind, behindPoints);
         }
 
         // Defensive invariant sweep: per-light dirty state may only exist for
@@ -1219,6 +1365,63 @@ public final class ShadowBaker
         return -1;
     }
 
+    /** Spare-capacity acquire for a light ranked past the WHOLE pool: its own
+     *  still-owned tile first, else a free slot, else the stalest slot not
+     *  touched for {@code STALE_FRAMES + 1}+ frames (a long-dead owner — gone
+     *  lights are otherwise only reclaimed by in-pool steals), preferring
+     *  worse tiers (backward scan) so the good tiers stay with real ranks.
+     *  NEVER steals from a live holder: full-strength stamps are observed at
+     *  age <= 1, and a live spare holder re-stamps {@code frameIndex - 1}
+     *  every frame so its observed age is exactly {@link #STALE_FRAMES} —
+     *  under this reclaim threshold (no spare-vs-spare thrash) but exactly AT
+     *  the in-pool steal threshold of {@link #acquireTile}, which is the
+     *  design: spare tenure lasts precisely until real demand shows up (the
+     *  claimant iterates earlier in rank order, so within one frame it steals
+     *  BEFORE the spare holder would re-stamp — no foreign-w window). A LIVE
+     *  owner that merely stopped refreshing (a behind-culled light demoted
+     *  past its margin) counts as reclaimable BY DESIGN: a visible past-pool
+     *  shadow outranks an invisible cached map, and the returning owner
+     *  first-bakes (mandatory-gated) only if actually reclaimed. */
+    private static int acquireSpareTile(long[] owner, int[] active, long id, int[] tierEnd)
+    {
+        int last = tierEnd[tierEnd.length - 1];
+        int free = -1;
+        int dead = -1;
+        int deadAge = Integer.MAX_VALUE;
+        for (int t = last - 1; t >= 0; t--)
+        {
+            if (owner[t] == id)
+            {
+                active[t] = frameIndex - 1;
+                return t;
+            }
+            if (owner[t] == NO_OWNER)
+            {
+                if (free < 0)
+                {
+                    free = t;
+                }
+            }
+            else if (frameIndex - active[t] > STALE_FRAMES && active[t] < deadAge)
+            {
+                dead = t;
+                deadAge = active[t];
+            }
+        }
+        int take = free >= 0 ? free : dead;
+        if (take < 0)
+        {
+            return -1;
+        }
+        if (free < 0)
+        {
+            purgeDirtyState(owner[take]); // victim first-bakes if it returns
+        }
+        owner[take] = id;
+        active[take] = frameIndex - 1;
+        return take;
+    }
+
     /** RELEASE-OLD half of the zero-blink tier handoff (I3): a bake just
      *  SUCCEEDED into {@code myTile}; if the light still owns a DIFFERENT old
      *  tile, free it for the pool. No purge of the TAKER side — the old
@@ -1240,14 +1443,26 @@ public final class ShadowBaker
      *  tile can orphan nothing. */
     private static void releaseOldTile(long[] owner, long id, int prevTile, int myTile)
     {
-        if (prevTile >= 0 && prevTile != myTile && owner[prevTile] == id)
+        // POOL-SCAN, not prevTile-only: ownership can stray from the dirty
+        // maps — a first-bake budget refusal (SHADOW_PENDING) keeps the slot
+        // but records no lastTile, and a later rank shift can acquire a
+        // DIFFERENT tile, leaving an orphan no map-keyed release ever frees
+        // (its eventual steal would purgeDirtyState this light's LIVE state on
+        // its new tile: spurious full re-bake + a possible one-frame blink).
+        // A successful bake into myTile is the one moment every other owned
+        // slot is provably unpublished (the SSBO already points at myTile), so
+        // free them all. O(pool) per successful bake — negligible next to it.
+        for (int t = 0; t < owner.length; t++)
         {
-            owner[prevTile] = NO_OWNER;
-            if (lastStaticTile.containsKey(id) && lastStaticTile.get(id) == prevTile)
+            if (owner[t] == id && t != myTile)
             {
-                lastStaticSig.remove(id);
-                lastStaticTile.remove(id);
-                lastStaticBlocks.remove(id);
+                owner[t] = NO_OWNER;
+                if (lastStaticTile.containsKey(id) && lastStaticTile.get(id) == t)
+                {
+                    lastStaticSig.remove(id);
+                    lastStaticTile.remove(id);
+                    lastStaticBlocks.remove(id);
+                }
             }
         }
     }
@@ -1341,7 +1556,7 @@ public final class ShadowBaker
         BlockShadowCache.retainOnly(liveIds);
         ShadowRenderer.retainBlockVbos(liveIds);
         SpotlightDepthAtlas.delete();
-        PointShadowTiers.deleteAll();
+        PointDepthAtlas.delete();
     }
 
     /** Record that the LIVE tile now holds this light's pure static content
@@ -1385,9 +1600,11 @@ public final class ShadowBaker
         }
 
         System.out.println(String.format(Locale.ROOT,
-            "[irlite] shadows: bake avg %.2f ms, max %.2f ms | static bakes: %d spot, %d point(x6) | overlays: %d spot, %d point | occluders %d, lights %d | %d frames",
+            "[irlite] shadows: bake avg %.2f ms, max %.2f ms | static bakes: %d spot, %d point(x6) | overlays: %d spot, %d point | demand: spot %d/%d (behind %d), point %d/%d (behind %d) | occluders %d, lights %d | %d frames",
             profNanos / 1e6 / Math.max(profFrames, 1), profMaxNanos / 1e6,
             profSpotBakes, profPointBakes, profSpotOverlays, profPointOverlays,
+            profSpotDemand, SPOT_TIER_END[SPOT_TIER_END.length - 1], profSpotBehind,
+            profPointDemand, POINT_TIER_END[POINT_TIER_END.length - 1], profPointBehind,
             occCount, LightRegistry.getCount(), profFrames));
 
         profWindowStart = now;
@@ -1398,6 +1615,10 @@ public final class ShadowBaker
         profPointBakes = 0;
         profSpotOverlays = 0;
         profPointOverlays = 0;
+        profSpotDemand = 0;
+        profPointDemand = 0;
+        profSpotBehind = 0;
+        profPointBehind = 0;
     }
 
     /** Drop per-light dirty state for ids not in {@code keep}. An empty set

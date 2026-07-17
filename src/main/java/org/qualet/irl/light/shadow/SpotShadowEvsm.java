@@ -38,8 +38,8 @@ import org.lwjgl.opengl.GL43;
  */
 public final class SpotShadowEvsm
 {
-    private static int texId = 0;      // EVSM atlas: base = atlas/2, levels = log2(TILE_SIZE)
-    private static int tempId = 0;     // one tile region (TILE/2)^2, ping-pong for the separable blur
+    private static int texId = 0;      // EVSM atlas: base = atlas/2, levels = log2(tileSize)
+    private static int tempId = 0;     // one tile region (tileSize/2)^2, ping-pong for the separable blur
     private static int levels = 0;
     private static int progConvert = 0, progBlur = 0, progMip = 0;
     private static int uCvSrc, uCvFar, uCvSrcOrigin, uCvDstOrigin, uCvDstSize;
@@ -232,7 +232,7 @@ public final class SpotShadowEvsm
                     // A sub-tile's chain ends at one texel per sub-tile — a
                     // deeper lod would mix neighbouring tiles. Full-size tiles
                     // (the whole degenerate layout) never hit this: levels =
-                    // log2(TILE_SIZE) already bottoms them out at one texel.
+                    // log2(tileSize) already bottoms them out at one texel.
                     continue;
                 }
                 GL20.glUniform2i(uMpSrcOrigin, pixX >> lod, pixY >> lod);
@@ -341,7 +341,7 @@ public final class SpotShadowEvsm
         }
 
         int prevTex = GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D);
-        levels = Integer.numberOfTrailingZeros(Integer.highestOneBit(SpotlightDepthAtlas.TILE_SIZE));
+        levels = Integer.numberOfTrailingZeros(Integer.highestOneBit(SpotlightDepthAtlas.getTileSize()));
 
         texId = GlStateManager._genTexture();
         GlStateManager._bindTexture(texId);
@@ -357,10 +357,10 @@ public final class SpotShadowEvsm
 
         tempId = GlStateManager._genTexture();
         GlStateManager._bindTexture(tempId);
-        // Sized for the LARGEST tile's lod-0 region (TILE_SIZE/2)^2; every
+        // Sized for the LARGEST tile's lod-0 region (tileSize/2)^2; every
         // quadtree sub-tile region at every lod is smaller, so it always fits.
         GL42.glTexStorage2D(GL11.GL_TEXTURE_2D, 1, GL30.GL_RGBA32F,
-            SpotlightDepthAtlas.TILE_SIZE / 2, SpotlightDepthAtlas.TILE_SIZE / 2);
+            SpotlightDepthAtlas.getTileSize() / 2, SpotlightDepthAtlas.getTileSize() / 2);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL12.GL_TEXTURE_BASE_LEVEL, 0);

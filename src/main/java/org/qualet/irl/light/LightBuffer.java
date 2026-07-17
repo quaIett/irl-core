@@ -17,7 +17,7 @@ import java.nio.ByteBuffer;
  *       vec4 colorIntensity;  // rgb = linear color, a = intensity
  *       vec4 dirType;         // xyz = direction (spot, normalized), w = type (0 point, 1 spot)
  *       vec4 cone;            // x = cos(outerAngle/2), y = cos(innerAngle/2), z = lightMask (0 all, 1 entities only, 2 blocks only), w = bulbSize (0 = use global)
- *       vec4 vlParams;        // x = anisotropy (HG g), y = vlDensity, z = beamStrength, w = shadowTile (-1 = none)
+ *       vec4 vlParams;        // x = anisotropy (HG g), y = vlDensity, z = beamStrength, w = shadowTile (-1 = none; spot: atlas tile, point: PointDepthAtlas block)
  *       vec4 cookie;          // x = gobo layer (-1 = none), y = rotation (rad), z = scale, w = flags (bit0 = invert) — spot-only projected mask
  *   };
  *
