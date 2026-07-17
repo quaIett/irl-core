@@ -155,6 +155,8 @@ public final class LightBuffer
         GL15.glBindBuffer(GL43.GL_SHADER_STORAGE_BUFFER, 0);
 
         scratch.clear();
+
+        VlGlobalsBuffer.upload();
     }
 
     /** Zero the GPU-side light count so a pipeline (re)enabled later can't
@@ -186,5 +188,7 @@ public final class LightBuffer
         }
 
         initialized = false;
+
+        VlGlobalsBuffer.delete();
     }
 }
