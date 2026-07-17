@@ -57,6 +57,13 @@ public final class ClusterGridBuffer
     // over 1 so a fragment sitting on the sphere surface can't slip between the
     // "inside" test and the projected screen bound.
     private static final float INSIDE_SLACK = 1.05F;
+    // Extra blocks added to the inside test, making it authoritative BEFORE the
+    // behind-near reject: the VL march starts AT the eye, so its pre-near ray segment
+    // (points within well under a block of the eye at any FOV) can pick up a sphere
+    // squashed entirely into the sub-near depth slab — a case the reject alone would
+    // hand zero tiles and break the VL cull's bit-identity invariant. Any sphere whose
+    // surface comes within this margin of the eye floods every tile instead.
+    private static final float NEAR_FLOOD_MARGIN = 1.0F;
     // Tiles of slack added on every side of the projected bound, absorbing the coarse
     // grid's quantisation so a light never under-covers the tile a fragment lands in.
     private static final int TILE_SLACK = 1;
@@ -212,18 +219,28 @@ public final class ClusterGridBuffer
         modelView.transform(v4);
         float vx = v4.x, vy = v4.y, vz = v4.z;
 
-        float d = -vz;
-        if (d + r < NEAR)
+        float len = (float) Math.sqrt(vx * vx + vy * vy + vz * vz);
+        if (len <= r * INSIDE_SLACK + NEAR_FLOOD_MARGIN)
         {
-            // Sphere entirely behind the near plane — cannot contain any rendered fragment.
+            // Camera inside (or within NEAR_FLOOD_MARGIN of) the sphere: conservatively
+            // cover every tile. Deliberately checked BEFORE the behind-near reject —
+            // see NEAR_FLOOD_MARGIN — so an eye-hugging sphere can never return zero
+            // tiles while the VL march's pre-near segment still crosses it.
+            setAllTiles(bit);
             return;
         }
 
-        float len = (float) Math.sqrt(vx * vx + vy * vy + vz * vz);
-        if (len <= r * INSIDE_SLACK || d - r <= NEAR)
+        float d = -vz;
+        if (d + r < NEAR)
         {
-            // Camera inside the sphere, or the sphere straddles the near plane:
-            // conservatively cover every tile.
+            // Sphere entirely behind the near plane and clear of the eye — cannot
+            // contain any rendered fragment nor any pre-near VL ray point.
+            return;
+        }
+
+        if (d - r <= NEAR)
+        {
+            // Sphere straddles the near plane: conservatively cover every tile.
             setAllTiles(bit);
             return;
         }
