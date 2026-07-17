@@ -15,8 +15,8 @@ import java.nio.ByteBuffer;
  *
  *   layout(std140, binding = BINDING) uniform IrliteVlGlobals {
  *       vec4 irlite_vlA;   // x = intensity, y = maxDist, z = tipBoost, w = tipRadius
- *       vec4 irlite_vlB;   // x = noiseAmount, y = noiseScale, z = noiseSpeed, w = reserved0
- *       uvec4 irlite_vlC;  // x = stepMax, y = shadowStride, z = noiseStride, w = flags (bit0 = VL shadows, bit1 = VL noise)
+ *       vec4 irlite_vlB;   // x = noiseAmount, y = noiseScale, z = noiseSpeed, w = frameIndex (wraps at 4096)
+ *       uvec4 irlite_vlC;  // x = stepMax, y = shadowStride, z = noiseStride, w = flags (bit0 = VL shadows, bit1 = VL noise, bit2 = blue-noise dither, bit3 = temporal dither rotation)
  *   };
  */
 public final class VlGlobalsBuffer
@@ -41,7 +41,12 @@ public final class VlGlobalsBuffer
     private static int stepMax = 48;            // IRLITE_VL_STEPS 48
     private static int shadowStride = 2;        // IRLITE_VL_SHADOW_STRIDE 2
     private static int noiseStride = 2;         // IRLITE_VL_NOISE_STRIDE 2
-    private static int flags = 0x3;             // bit0 = VL shadows, bit1 = VL noise; all-on like LightBuffer's header default
+    private static int flags = 0xF;             // bit0 = VL shadows, bit1 = VL noise, bit2 = blue-noise dither (default on), bit3 = temporal dither rotation (default on)
+
+    /** Frame counter for the temporal dither rotation (flags bit3): written to
+     *  irlite_vlB.w each upload, wrapped to 12 bits so the float stays exact.
+     *  No setter — it only ever ticks here. */
+    private static int frameIndex = 0;
 
     private VlGlobalsBuffer()
     {}
@@ -94,9 +99,11 @@ public final class VlGlobalsBuffer
 
         scratch.clear();
         scratch.putFloat(intensity).putFloat(maxDist).putFloat(tipBoost).putFloat(tipRadius);
-        scratch.putFloat(noiseAmount).putFloat(noiseScale).putFloat(noiseSpeed).putFloat(0F);  // w = reserved0
+        scratch.putFloat(noiseAmount).putFloat(noiseScale).putFloat(noiseSpeed).putFloat(frameIndex);  // w = frameIndex
         scratch.putInt(stepMax).putInt(shadowStride).putInt(noiseStride).putInt(flags);
         scratch.flip();
+
+        frameIndex = (frameIndex + 1) & 4095;   // one tick per upload = per frame
 
         GL15.glBindBuffer(GL31.GL_UNIFORM_BUFFER, ubo);
         GL15.glBufferSubData(GL31.GL_UNIFORM_BUFFER, 0L, scratch);

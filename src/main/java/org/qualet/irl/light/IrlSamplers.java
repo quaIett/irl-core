@@ -85,6 +85,9 @@ public final class IrlSamplers
         register("irl_pointEvsm1", () -> PointShadowEvsm.getGlTextureId(1), GL40.GL_TEXTURE_CUBE_MAP_ARRAY);
         register("irl_pointShadowPyramid2", () -> PointShadowPyramid.getGlTextureId(2), GL30.GL_TEXTURE_2D_ARRAY);
         register("irl_pointEvsm2", () -> PointShadowEvsm.getGlTextureId(2), GL40.GL_TEXTURE_CUBE_MAP_ARRAY);
+        // VL CP2: bundled 128x128 R8 spatial blue noise for the VL march-start
+        // dither (VlGlobalsBuffer flags bit2). Plain 2D, no target rebind.
+        register("irl_blueNoise", BlueNoiseTexture::getId, GL11.GL_TEXTURE_2D);
     }
 
     private IrlSamplers()
