@@ -114,6 +114,13 @@ public interface ShadowConfig {
      *  from a light cast no shadow even when the light's range is larger. Bounds
      *  the per-light bbox walk. */
     int shadowBlockRadius();
+
+    /** ADDED 2026-07-18 (partial-tile AABB): horizontal pose slack of the spot
+     *  dyn-rect AABB, as a fraction of the caster's half-height. OPTIONAL — a
+     *  {@code default} method (0.9) and an optional Builder setter, so shims
+     *  written against the original five getters keep compiling; the redactor
+     *  deliberately does not override it. */
+    default float shadowPoseReach() { return 0.9f; }
 }
 ```
 
@@ -126,6 +133,7 @@ public interface ShadowConfig {
 | `shadowBakeBudget()` | `4` | any int; `<= 0` ⇒ unlimited |
 | `shadowBlocks()` | `true` | — |
 | `shadowBlockRadius()` | `24` | blocks; `> 0` |
+| `shadowPoseReach()` | `0.9` | `>= 0` (addon UI slider `0..2`); interface `default`, NOT duplicated per-mod; NaN/negative sanitized at the read site |
 
 These defaults are identical in `LightConfig` (redactor, mutable static fields)
 and `IrliteConfig` (addon, null-safe BBS `Value*` fallbacks) today. Core SHALL

@@ -45,6 +45,12 @@ public final class ShadowBaker
      *  with one independent model caster per lamp while leaving room for actors. */
     private static final int MAX_OCCLUDERS = 128;
     private static final float OVERLAP_MARGIN = 0.5f;
+    /** A dyn/copy rect covering at least NUM/DEN of its tile is promoted to
+     *  {@link ShadowRect#FULL}: partial copy + filter dispatch stops paying
+     *  off (aprons and per-rect setup eat the margin). Shared by the two
+     *  coversMost call sites so they can never drift apart. */
+    private static final int COVERS_MOST_NUM = 15;
+    private static final int COVERS_MOST_DEN = 16;
 
     private static final long FNV_OFFSET = 1469598103934665603L;
     private static final long FNV_PRIME = 1099511628211L;
@@ -58,6 +64,15 @@ public final class ShadowBaker
     private static final float[] oy = new float[MAX_OCCLUDERS];
     private static final float[] oz = new float[MAX_OCCLUDERS];
     private static final float[] orad = new float[MAX_OCCLUDERS];
+    /** Horizontal half-DIAGONAL of the caster's own (unposed) box footprint,
+     *  0.5*hypot(ex,ez)*scale, NO margin — the yaw-invariant tight bound the
+     *  spot dyn-rect AABB is built from ({@link #computeSpotDynRect}); the
+     *  raw-sphere emit path stores the full radius here so the AABB
+     *  degenerates to exactly the sphere box. Cull still consumes only
+     *  {@link #orad}. */
+    private static final float[] orh = new float[MAX_OCCLUDERS];
+    /** Vertical half-extent (ey*0.5)*scale, NO margin; sphere path = radius. */
+    private static final float[] ohv = new float[MAX_OCCLUDERS];
     /** Static-layer membership, INDEPENDENT of {@link #occType} (seam INVARIANT 2).
      *  True => baked into the never-rebaked static base; its silhouette changes only
      *  when {@link #ostatichash} changes. False (every redactor caster — all dynamic
@@ -826,7 +841,7 @@ public final class ShadowBaker
                 }
                 long copyRect = bakedStatic ? ShadowRect.FULL
                     : ShadowRect.union(dynRect, lastDynRect.containsKey(id) ? lastDynRect.get(id) : ShadowRect.FULL);
-                if (copyRect != ShadowRect.FULL && ShadowRect.coversMost(copyRect, ts, 7, 10))
+                if (copyRect != ShadowRect.FULL && ShadowRect.coversMost(copyRect, ts, COVERS_MOST_NUM, COVERS_MOST_DEN))
                 {
                     copyRect = ShadowRect.FULL;
                 }
@@ -2012,11 +2027,18 @@ public final class ShadowBaker
      * {@link ShadowRenderer#beginSpot}'s matrices exactly: anchor A =
      * round((float) light), eye = L - A, same up rule, NEAR 0.05, aspect 1 —
      * a convex box in front of the near plane projects inside the convex hull
-     * of its 8 projected corners, so the AABB (which contains the caster's
-     * cull sphere, which contains the drawn silhouette per seam INVARIANT 5)
-     * bounds the depth writes conservatively. The scissor set from this rect
-     * is the HARD bound for those writes, so an under-estimate degrades to
-     * visible silhouette clipping, never to the filters missing fresh depth.
+     * of its 8 projected corners, so the AABB bounds the depth writes
+     * conservatively. The AABB uses the caster's REAL per-axis half-extents
+     * ({@link #orh}/{@link #ohv}) instead of the cull sphere: horizontal =
+     * footprint half-diagonal + pose slack (animated limbs reach past the
+     * emitted hitbox, {@link ShadowConfig#shadowPoseReach()} — a live user
+     * knob), vertical = half-height +
+     * OVERLAP_MARGIN, both capped by the sphere radius — so the box never
+     * exceeds the sphere box that INVARIANT 5 pins as the outer bound, and
+     * the raw-sphere emit path (rh==hv==rad) reproduces it exactly. The
+     * scissor set from this rect is the HARD bound for those writes, so an
+     * under-estimate degrades to visible silhouette clipping, never to the
+     * filters missing fresh depth.
      */
     private static long computeSpotDynRect(float lx, float ly, float lz,
                                            double lxD, double lyD, double lzD,
@@ -2046,6 +2068,13 @@ public final class ShadowBaker
             .lookAt(ex, ey, ez, ex + ndx, ey + ndy, ez + ndz,
                     0f, zUp ? 0f : 1f, zUp ? 1f : 0f);
 
+        // Live user knob; sanitize so a malformed config value degrades to the
+        // built-in default instead of NaN-poisoning the corner math.
+        float poseReach = ShadowEngine.config().shadowPoseReach();
+        if (!(poseReach >= 0f))
+        {
+            poseReach = 0.9f;
+        }
         float minU = Float.POSITIVE_INFINITY, minV = Float.POSITIVE_INFINITY;
         float maxU = Float.NEGATIVE_INFINITY, maxV = Float.NEGATIVE_INFINITY;
         boolean any = false;
@@ -2059,12 +2088,14 @@ public final class ShadowBaker
             any = true;
             float cx = ox[k] - axi, cy = oy[k] - ayi, cz = oz[k] - azi;
             float rad = orad[k];
+            float hh = Math.min(orh[k] + Math.max(OVERLAP_MARGIN, poseReach * ohv[k]), rad);
+            float hy = Math.min(ohv[k] + OVERLAP_MARGIN, rad);
             for (int corner = 0; corner < 8; corner++)
             {
                 dynRectVec.set(
-                    cx + (((corner & 1) == 0) ? -rad : rad),
-                    cy + (((corner & 2) == 0) ? -rad : rad),
-                    cz + (((corner & 4) == 0) ? -rad : rad),
+                    cx + (((corner & 1) == 0) ? -hh : hh),
+                    cy + (((corner & 2) == 0) ? -hy : hy),
+                    cz + (((corner & 4) == 0) ? -hh : hh),
                     1f);
                 dynRectMatrix.transform(dynRectVec);
                 if (dynRectVec.w < 0.05f)
@@ -2093,7 +2124,7 @@ public final class ShadowBaker
             return ShadowRect.FULL; // fully off-tile after clamp — shouldn't happen for cone-culled casters
         }
         long rect = ShadowRect.pack(x0, y0, x1, y1);
-        return ShadowRect.coversMost(rect, ts, 7, 10) ? ShadowRect.FULL : rect;
+        return ShadowRect.coversMost(rect, ts, COVERS_MOST_NUM, COVERS_MOST_DEN) ? ShadowRect.FULL : rect;
     }
 
     /** Small angular slack (radians) added to the spot cone test so a subject
@@ -2155,7 +2186,8 @@ public final class ShadowBaker
      *  a nearer newcomer replaces the farthest kept entry, OPEN-2 fix).
      *  {@code emitFromBox} computes the cull-pinned bounding
      *  sphere (mid-height center + circumscribing box-diagonal radius, INVARIANT 5)
-     *  so no source can supply a foreign sphere. */
+     *  so no source can supply a foreign sphere, plus the per-axis half-extents
+     *  ({@link #orh}/{@link #ohv}) the spot dyn-rect tightens with. */
     private static final OccluderSink SINK = new OccluderSink()
     {
         @Override
@@ -2167,14 +2199,18 @@ public final class ShadowBaker
             // -> getLengthX() after 1.20.1; fields are identical across versions).
             double ex = box.maxX - box.minX, ey = box.maxY - box.minY, ez = box.maxZ - box.minZ;
             float rad = (float) (0.5 * Math.sqrt(ex * ex + ey * ey + ez * ez) * scale) + OVERLAP_MARGIN;
-            put(caster, type, isStatic, (float) interpX, (float) (interpY + ey * 0.5), (float) interpZ, rad, staticHash);
+            float rh = (float) (0.5 * Math.sqrt(ex * ex + ez * ez) * scale);
+            float hv = (float) (0.5 * ey * scale);
+            put(caster, type, isStatic, (float) interpX, (float) (interpY + ey * 0.5), (float) interpZ, rad, rh, hv, staticHash);
         }
 
         @Override
         public void emit(Object caster, int type, boolean isStatic,
                          float cx, float cy, float cz, float radius, long staticHash)
         {
-            put(caster, type, isStatic, cx, cy, cz, radius, staticHash);
+            // No box to tighten from: per-axis half-extents fall back to the
+            // sphere radius, so the dyn-rect AABB is exactly the sphere box.
+            put(caster, type, isStatic, cx, cy, cz, radius, radius, radius, staticHash);
         }
     };
 
@@ -2185,7 +2221,8 @@ public final class ShadowBaker
      *  only after a replacement; downstream order is irrelevant
      *  ({@link #scanInRange} iterates all entries). */
     private static void put(Object caster, int type, boolean isStatic,
-                            float cx, float cy, float cz, float radius, long staticHash)
+                            float cx, float cy, float cz, float radius,
+                            float rh, float hv, long staticHash)
     {
         float ddx = cx - occCamX, ddy = cy - occCamY, ddz = cz - occCamZ;
         float d2 = ddx * ddx + ddy * ddy + ddz * ddz;
@@ -2194,6 +2231,13 @@ public final class ShadowBaker
         if (!Float.isFinite(d2) || !Float.isFinite(radius) || radius < 0f)
         {
             return;
+        }
+        // Malformed per-axis extents (NaN / negative) degrade the same way the
+        // whole caster would: to the guaranteed-conservative sphere box.
+        if (!(rh >= 0f) || !(hv >= 0f))
+        {
+            rh = radius;
+            hv = radius;
         }
         int idx;
         boolean replacedFarthest = false;
@@ -2217,6 +2261,8 @@ public final class ShadowBaker
         oy[idx] = cy;
         oz[idx] = cz;
         orad[idx] = radius;
+        orh[idx] = rh;
+        ohv[idx] = hv;
         ostatichash[idx] = staticHash;
         odist2[idx] = d2;
 

@@ -1,6 +1,7 @@
 package org.qualet.irl.light.shadow;
 
 import java.util.function.BooleanSupplier;
+import java.util.function.DoubleSupplier;
 import java.util.function.IntSupplier;
 
 /**
@@ -43,6 +44,23 @@ public interface ShadowConfig
      *  per-light bbox walk. Default 24. */
     int shadowBlockRadius();
 
+    /** Horizontal pose slack of the partial-tile spot overlay's dyn-rect AABB,
+     *  as a fraction of the caster's half-height: sources emit the UNPOSED
+     *  hitbox, but an animated limb pivots near the body, so its reach past
+     *  that box is bounded by roughly the limb length (vanilla humanoid
+     *  sideways arm tip ~1.19 blocks off-center vs hitbox half-diagonal
+     *  ~0.42; 0.42 + 0.9*hv(0.9) = 1.23 covers it). The scissor cut from the
+     *  rect is a HARD bound — an under-estimate clips the silhouette visibly
+     *  — so RAISE this when wide poses / oversized forms show clipped shadow
+     *  edges; every axis stays capped by the caster's cull sphere, so large
+     *  values saturate at the pre-AABB sphere box (proven clip-free), they
+     *  only cost filter area. Pulled fresh every bake (live knob). OPTIONAL
+     *  (a {@code default}): mods that predate it keep compiling and get 0.9. */
+    default float shadowPoseReach()
+    {
+        return 0.9f;
+    }
+
     /**
      * Canonical fallback ({@code 1 / true / 4 / true / 24}) so a mod that never
      * installs a config still bakes instead of NPEing. {@link ShadowEngine} uses this
@@ -79,6 +97,7 @@ public interface ShadowConfig
         private IntSupplier shadowBakeBudget;
         private BooleanSupplier shadowBlocks;
         private IntSupplier shadowBlockRadius;
+        private DoubleSupplier shadowPoseReach;
 
         private Builder()
         {}
@@ -113,6 +132,14 @@ public interface ShadowConfig
             return this;
         }
 
+        /** OPTIONAL (unlike the five originals): omitted = the interface
+         *  default 0.9, so pre-existing shims keep building unchanged. */
+        public Builder shadowPoseReach(DoubleSupplier shadowPoseReach)
+        {
+            this.shadowPoseReach = shadowPoseReach;
+            return this;
+        }
+
         public ShadowConfig build()
         {
             IntSupplier quality = requireNonNull(shadowQuality, "shadowQuality");
@@ -120,6 +147,7 @@ public interface ShadowConfig
             IntSupplier bakeBudget = requireNonNull(shadowBakeBudget, "shadowBakeBudget");
             BooleanSupplier blocks = requireNonNull(shadowBlocks, "shadowBlocks");
             IntSupplier blockRadius = requireNonNull(shadowBlockRadius, "shadowBlockRadius");
+            DoubleSupplier poseReach = shadowPoseReach; // optional, may be null
             return new ShadowConfig()
             {
                 public int shadowQuality()     { return quality.getAsInt(); }
@@ -127,6 +155,7 @@ public interface ShadowConfig
                 public int shadowBakeBudget()  { return bakeBudget.getAsInt(); }
                 public boolean shadowBlocks()  { return blocks.getAsBoolean(); }
                 public int shadowBlockRadius() { return blockRadius.getAsInt(); }
+                public float shadowPoseReach() { return poseReach == null ? 0.9f : (float) poseReach.getAsDouble(); }
             };
         }
 
