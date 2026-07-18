@@ -61,10 +61,42 @@ public final class SpotlightDepthAtlas
     private SpotlightDepthAtlas()
     {}
 
+    /** Extra right-shift of the spot EVSM working base below the depth atlas:
+     *  1 = base atlas/2 (the historic contract), 2 = base atlas/4 (ULTRA
+     *  relief — the filter chain re-filters every overlay tile per frame, and
+     *  at 4096 tiles the full-base chain alone capped the frame rate).
+     *  Preset-mutable like the tile size ({@link IRLShadowQuality#apply});
+     *  the injected GLSL re-derives the ratio per fetch from textureSize, so
+     *  a shift change needs no shader work — only the ratio-aware packs
+     *  (piloted on CR) keep their EVSM branch at shift 2; older patches'
+     *  strict size gate falls back to PCF, never to garbage. */
+    private static int evsmShift = 1;
+
     /** Current tile resolution (tier-0 extent); preset-mutable via {@link #setTileSize}. */
     public static int getTileSize()
     {
         return INSTANCE.getTileSize();
+    }
+
+    /** The EVSM base shift (1 = atlas/2, 2 = atlas/4); see {@link #setEvsmShift}. */
+    public static int evsmShift()
+    {
+        return evsmShift;
+    }
+
+    /** Switch the EVSM base shift; frees the EVSM textures on a change so the
+     *  next flush re-allocates at the new base ({@link SpotShadowEvsm} derives
+     *  every size from this facade). Independent of {@link #setTileSize} —
+     *  the two may change together on a preset switch in any order. */
+    public static void setEvsmShift(int shift)
+    {
+        int s = Math.max(1, Math.min(2, shift));
+        if (s == evsmShift)
+        {
+            return;
+        }
+        SpotShadowEvsm.delete();
+        evsmShift = s;
     }
 
     public static int getAtlasWidth()

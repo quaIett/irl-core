@@ -837,8 +837,9 @@ public final class ShadowBaker
         }
 
         // one batched pyramid + EVSM pass over every tile the spot loop dirtied (before the SSBO flush / Iris passes)
-        probeSection("bake-spot-filter");
+        probeSection("bake-spot-pyr");
         SpotShadowPyramid.flushDirty();
+        probeSection("bake-spot-evsm");
         SpotShadowEvsm.flushDirty();
         probeSection("bake-point");
 
@@ -1229,8 +1230,9 @@ public final class ShadowBaker
         }
 
         // one batched pyramid + EVSM pass over every block the point loop dirtied (before the SSBO flush / Iris passes)
-        probeSection("bake-point-filter");
+        probeSection("bake-point-pyr");
         PointShadowPyramid.flushDirty();
+        probeSection("bake-point-evsm");
         PointShadowEvsm.flushDirty();
         probeSection("bake-tail");
 

@@ -12,12 +12,16 @@ import org.lwjgl.opengl.GL43;
 
 /**
  * EVSM4 prefilter of the LIVE spot depth atlas (F2a of the shadow filtering
- * refactor). RGBA32F, base level = atlas/2 (one texel = the averaged warped
- * moments of a 2x2 depth quad), Gaussian-blurred base + averaged mip chain
- * down to one texel per tile. The inject samples it as {@code irl_spotEvsm}
- * with one trilinear textureLod (lod picked from the PCSS penumbra estimate)
- * and a Chebyshev bound — replacing the whole PCF loop for wide penumbras
- * with a deterministic, grain-free filter.
+ * refactor). RGBA32F, base level = atlas &gt;&gt; shift (one texel = the averaged
+ * warped moments of a 2^shift x 2^shift depth quad; shift 1 normally, 2 at
+ * ULTRA — {@link SpotlightDepthAtlas#evsmShift}), Gaussian-blurred base +
+ * averaged mip chain down to one texel per tile. The inject samples it as
+ * {@code irl_spotEvsm} with one trilinear textureLod (lod picked from the
+ * PCSS penumbra estimate) and a Chebyshev bound — replacing the whole PCF
+ * loop for wide penumbras with a deterministic, grain-free filter. The
+ * ratio-aware GLSL derives the shift per fetch from textureSize (packs with
+ * the older strict atlas/2 size gate fall back to PCF at ULTRA, never to
+ * garbage).
  *
  * Moment warp CONTRACT (mirrored byte-for-byte by the GLSL Chebyshev branch):
  *   wp = exp(+42 * lz), wn = -exp(-8 * lz), where lz = (dist - near)/(far - near)
@@ -38,11 +42,11 @@ import org.lwjgl.opengl.GL43;
  */
 public final class SpotShadowEvsm
 {
-    private static int texId = 0;      // EVSM atlas: base = atlas/2, levels = log2(tileSize)
-    private static int tempId = 0;     // one tile region (tileSize/2)^2, ping-pong for the separable blur
+    private static int texId = 0;      // EVSM atlas: base = atlas >> shift, levels = log2(tileSize) - shift + 1
+    private static int tempId = 0;     // one tile region (tileSize >> shift)^2, ping-pong for the separable blur
     private static int levels = 0;
     private static int progConvert = 0, progBlur = 0, progMip = 0;
-    private static int uCvSrc, uCvFar, uCvSrcOrigin, uCvDstOrigin, uCvDstSize;
+    private static int uCvSrc, uCvFar, uCvStep, uCvSrcOrigin, uCvDstOrigin, uCvDstSize;
     private static int uBlSrc, uBlSrcLod, uBlHorizontal, uBlSrcOrigin, uBlDstOrigin, uBlSize;
     private static int uMpSrc, uMpSrcLod, uMpSrcOrigin, uMpDstOrigin, uMpDstSize;
     private static boolean programsAttempted = false;
@@ -56,11 +60,13 @@ public final class SpotShadowEvsm
         "layout(local_size_x = 8, local_size_y = 8) in;\n" +
         "layout(rgba32f, binding = 0) uniform writeonly image2D dst;\n";
 
-    // depth 2x2 -> warped moments (averaging moments IS the correct 2x2 prefilter: they are linear statistics);
-    // depth is linearized per tile (near 0.05, far = light range) before the warp — see the class contract
+    // depth NxN -> warped moments (averaging moments IS the correct box prefilter: they are linear
+    // statistics); N = srcStep = 2^evsmShift (2 normally, 4 at ULTRA's atlas/4 base). Depth is
+    // linearized per tile (near 0.05, far = light range) before the warp — see the class contract
     private static final String CONVERT_SRC = COMMON +
         "uniform sampler2D srcDepth;\n" +
         "uniform float far;\n" +
+        "uniform int srcStep;\n" +
         "uniform ivec2 srcOrigin;\n" +
         "uniform ivec2 dstOrigin;\n" +
         "uniform ivec2 dstSize;\n" +
@@ -68,10 +74,10 @@ public final class SpotShadowEvsm
         "{\n" +
         "    ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n" +
         "    if (g.x >= dstSize.x || g.y >= dstSize.y) return;\n" +
-        "    ivec2 s = srcOrigin + g * 2;\n" +
+        "    ivec2 s = srcOrigin + g * srcStep;\n" +
         "    vec4 m = vec4(0.0);\n" +
-        "    for (int j = 0; j < 2; j++)\n" +
-        "    for (int i = 0; i < 2; i++)\n" +
+        "    for (int j = 0; j < srcStep; j++)\n" +
+        "    for (int i = 0; i < srcStep; i++)\n" +
         "    {\n" +
         "        float z01 = texelFetch(srcDepth, s + ivec2(i, j), 0).r;\n" +
         "        float ndcZ = z01 * 2.0 - 1.0;\n" +
@@ -81,7 +87,7 @@ public final class SpotShadowEvsm
         "        float wn = -exp(-8.0 * lz);\n" +
         "        m += vec4(wp, wp * wp, wn, wn * wn);\n" +
         "    }\n" +
-        "    imageStore(dst, dstOrigin + g, m * 0.25);\n" +
+        "    imageStore(dst, dstOrigin + g, m / float(srcStep * srcStep));\n" +
         "}\n";
 
     // separable Gaussian 1-4-6-4-1, reads clamped inside the tile region (no cross-tile bleed);
@@ -189,6 +195,10 @@ public final class SpotShadowEvsm
         // rect source of the quadtree layout. INVARIANT (power-of-two
         // subdivision): every tile origin is a multiple of its own tileSizePx,
         // so shifting origin and size right in lockstep is exact at every lod.
+        // shift = the EVSM base's extra right-shift below the depth atlas
+        // (1 = atlas/2, 2 = ULTRA's atlas/4); a shift change deletes the
+        // textures (setEvsmShift), so the allocation always matches it.
+        int shift = SpotlightDepthAtlas.evsmShift();
         for (int tile = 0; tile < SpotlightDepthAtlas.tileCount(); tile++)
         {
             if ((mask & (1L << tile)) == 0L)
@@ -197,13 +207,18 @@ public final class SpotShadowEvsm
             }
             int pixX = SpotlightDepthAtlas.tilePixelX(tile);
             int pixY = SpotlightDepthAtlas.tilePixelY(tile);
-            int base = SpotlightDepthAtlas.tileSizePx(tile) >> 1; // tile region width at EVSM lod 0
-            int ox = pixX >> 1, oy = pixY >> 1;
+            int base = SpotlightDepthAtlas.tileSizePx(tile) >> shift; // tile region width at EVSM lod 0
+            if (base == 0)
+            {
+                continue; // degenerate sub-tile smaller than the base step — nothing to filter
+            }
+            int ox = pixX >> shift, oy = pixY >> shift;
 
             // convert: depth -> linearized warped moments, EVSM mip0 (tile region)
             GlStateManager._glUseProgram(progConvert);
             GL20.glUniform1i(uCvSrc, unit);
             GL20.glUniform1f(uCvFar, tileFar[tile]);
+            GL20.glUniform1i(uCvStep, 1 << shift);
             GlStateManager._bindTexture(depthTex);
             GL42.glBindImageTexture(0, texId, 0, false, 0, GL15.GL_WRITE_ONLY, GL30.GL_RGBA32F);
             GL20.glUniform2i(uCvSrcOrigin, pixX, pixY);
@@ -232,17 +247,18 @@ public final class SpotShadowEvsm
                 }
                 int pixX = SpotlightDepthAtlas.tilePixelX(tile);
                 int pixY = SpotlightDepthAtlas.tilePixelY(tile);
-                int dstW = SpotlightDepthAtlas.tileSizePx(tile) >> (lod + 1);
+                int dstW = SpotlightDepthAtlas.tileSizePx(tile) >> (lod + shift);
                 if (dstW == 0)
                 {
                     // A sub-tile's chain ends at one texel per sub-tile — a
                     // deeper lod would mix neighbouring tiles. Full-size tiles
                     // (the whole degenerate layout) never hit this: levels =
-                    // log2(tileSize) already bottoms them out at one texel.
+                    // log2(tileSize) - shift + 1 already bottoms them out at
+                    // one texel.
                     continue;
                 }
-                GL20.glUniform2i(uMpSrcOrigin, pixX >> lod, pixY >> lod);
-                GL20.glUniform2i(uMpDstOrigin, pixX >> (lod + 1), pixY >> (lod + 1));
+                GL20.glUniform2i(uMpSrcOrigin, pixX >> (lod + shift - 1), pixY >> (lod + shift - 1));
+                GL20.glUniform2i(uMpDstOrigin, pixX >> (lod + shift), pixY >> (lod + shift));
                 GL20.glUniform2i(uMpDstSize, dstW, dstW);
                 GL43.glDispatchCompute((dstW + 7) / 8, (dstW + 7) / 8, 1);
             }
@@ -253,14 +269,14 @@ public final class SpotShadowEvsm
                 {
                     continue;
                 }
-                int dstW = SpotlightDepthAtlas.tileSizePx(tile) >> (lod + 1);
+                int dstW = SpotlightDepthAtlas.tileSizePx(tile) >> (lod + shift);
                 if (dstW < 2)
                 {
                     continue; // 1-texel region: a 5-tap blur adds nothing (and a 0-texel one is past the chain's end)
                 }
                 blurTileLevel(unit, lod,
-                    SpotlightDepthAtlas.tilePixelX(tile) >> (lod + 1),
-                    SpotlightDepthAtlas.tilePixelY(tile) >> (lod + 1),
+                    SpotlightDepthAtlas.tilePixelX(tile) >> (lod + shift),
+                    SpotlightDepthAtlas.tilePixelY(tile) >> (lod + shift),
                     dstW);
             }
         }
@@ -319,6 +335,7 @@ public final class SpotShadowEvsm
             {
                 uCvSrc = GL20.glGetUniformLocation(progConvert, "srcDepth");
                 uCvFar = GL20.glGetUniformLocation(progConvert, "far");
+                uCvStep = GL20.glGetUniformLocation(progConvert, "srcStep");
                 uCvSrcOrigin = GL20.glGetUniformLocation(progConvert, "srcOrigin");
                 uCvDstOrigin = GL20.glGetUniformLocation(progConvert, "dstOrigin");
                 uCvDstSize = GL20.glGetUniformLocation(progConvert, "dstSize");
@@ -347,12 +364,16 @@ public final class SpotShadowEvsm
         }
 
         int prevTex = GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D);
-        levels = Integer.numberOfTrailingZeros(Integer.highestOneBit(SpotlightDepthAtlas.getTileSize()));
+        // Base = atlas >> shift; the chain still ends at one texel per full
+        // tile, so a deeper shift means one level fewer (min 1, defensive).
+        int shift = SpotlightDepthAtlas.evsmShift();
+        levels = Math.max(1,
+            Integer.numberOfTrailingZeros(Integer.highestOneBit(SpotlightDepthAtlas.getTileSize())) - shift + 1);
 
         texId = GlStateManager._genTexture();
         GlStateManager._bindTexture(texId);
         GL42.glTexStorage2D(GL11.GL_TEXTURE_2D, levels, GL30.GL_RGBA32F,
-            SpotlightDepthAtlas.getAtlasWidth() / 2, SpotlightDepthAtlas.getAtlasHeight() / 2);
+            SpotlightDepthAtlas.getAtlasWidth() >> shift, SpotlightDepthAtlas.getAtlasHeight() >> shift);
         // trilinear: the shader picks a fractional lod from the penumbra width
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_LINEAR_MIPMAP_LINEAR);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_LINEAR);
@@ -363,10 +384,11 @@ public final class SpotShadowEvsm
 
         tempId = GlStateManager._genTexture();
         GlStateManager._bindTexture(tempId);
-        // Sized for the LARGEST tile's lod-0 region (tileSize/2)^2; every
-        // quadtree sub-tile region at every lod is smaller, so it always fits.
+        // Sized for the LARGEST tile's lod-0 region (tileSize >> shift)^2;
+        // every quadtree sub-tile region at every lod is smaller, so it fits.
         GL42.glTexStorage2D(GL11.GL_TEXTURE_2D, 1, GL30.GL_RGBA32F,
-            SpotlightDepthAtlas.getTileSize() / 2, SpotlightDepthAtlas.getTileSize() / 2);
+            Math.max(1, SpotlightDepthAtlas.getTileSize() >> shift),
+            Math.max(1, SpotlightDepthAtlas.getTileSize() >> shift));
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL12.GL_TEXTURE_BASE_LEVEL, 0);

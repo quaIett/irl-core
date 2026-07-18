@@ -49,6 +49,12 @@ public enum IRLShadowQuality
         current = this;
         PointDepthAtlas.setTileSize(this.pointFaceSize);
         SpotlightDepthAtlas.setTileSize(this.spotTileSize);
+        // ULTRA runs the spot EVSM chain at atlas/4 instead of atlas/2: the
+        // filter re-runs per overlay tile per frame, and at 4096 tiles the
+        // full-base chain alone (~30 ms for a 25-lamp scene) capped the frame
+        // rate. Quality cost is one lod of minimum penumbra softness, only at
+        // ULTRA. Ratio-aware packs keep EVSM; older patches gate down to PCF.
+        SpotlightDepthAtlas.setEvsmShift(this == ULTRA ? 2 : 1);
     }
 
     /** Map a 0..3 setting value to a preset and apply it if it changed. */
