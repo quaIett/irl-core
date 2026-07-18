@@ -167,6 +167,12 @@ public final class SpotShadowEvsm
             return; // inert on failure — the GLSL textureSize gate falls back to the PCF path
         }
 
+        ShadowBakeProbe probe = ShadowEngine.bakeProbe();
+        if (probe != null)
+        {
+            probe.counter("evsm.sp", Long.bitCount(mask));
+        }
+
         int prevProgram = GL11.glGetInteger(GL20.GL_CURRENT_PROGRAM);
         int prevTex = GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D);
         int unit = GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE) - GL13.GL_TEXTURE0;

@@ -18,6 +18,9 @@ public final class ShadowEngine
 {
     private static volatile ShadowCasterSource source;
     private static volatile ShadowConfig config = ShadowConfig.DEFAULTS;
+    /** Optional dev-profiler probe; null (the default) = disabled, every bake
+     *  call site degrades to a null-check no-op. */
+    private static volatile ShadowBakeProbe bakeProbe;
 
     private ShadowEngine()
     {}
@@ -53,5 +56,19 @@ public final class ShadowEngine
     public static ShadowConfig config()
     {
         return config;
+    }
+
+    /** Install the optional bake profiler probe (dev-only; see
+     *  {@link ShadowBakeProbe}). Unlike {@link #install} this is genuinely
+     *  optional — no mod installs one in normal runs. */
+    public static void installBakeProbe(ShadowBakeProbe probe)
+    {
+        bakeProbe = probe;
+    }
+
+    /** The installed bake probe, or null (the default: profiling disabled). */
+    public static ShadowBakeProbe bakeProbe()
+    {
+        return bakeProbe;
     }
 }

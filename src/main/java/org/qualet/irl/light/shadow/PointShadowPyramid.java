@@ -161,6 +161,12 @@ public final class PointShadowPyramid
             return; // inert on failure — the GLSL pyrMax>0 guard falls back to full PCSS
         }
 
+        ShadowBakeProbe probe = ShadowEngine.bakeProbe();
+        if (probe != null)
+        {
+            probe.counter("pyr.pt", Long.bitCount(mask));
+        }
+
         // --- save the touched state once per batch ---
         int prevProgram = GL11.glGetInteger(GL20.GL_CURRENT_PROGRAM);
         int unit = GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE) - GL13.GL_TEXTURE0;

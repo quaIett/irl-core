@@ -122,6 +122,12 @@ public final class SpotShadowPyramid
             return; // allocation/compile failed once; stays inert — the GLSL pyrMax>0 guard falls back to full PCSS
         }
 
+        ShadowBakeProbe probe = ShadowEngine.bakeProbe();
+        if (probe != null)
+        {
+            probe.counter("pyr.sp", Long.bitCount(mask));
+        }
+
         // --- save the state we touch (current program, one 2D texture binding, image unit 0): once per batch ---
         int prevProgram = GL11.glGetInteger(GL20.GL_CURRENT_PROGRAM);
         int prevTex = GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D);

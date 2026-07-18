@@ -306,6 +306,33 @@ public final class ShadowBaker
      *  list + VBO caches for lights that disappeared. */
     private static final LongOpenHashSet liveIds = new LongOpenHashSet();
 
+    // --- Optional GPU bake probe (ShadowEngine.installBakeProbe, dev-only) ----
+    // Sections partition the host mod's single bake GPU-timer bracket into
+    // SIBLING brackets at the bakeInner seams (GL_TIME_ELAPSED cannot nest);
+    // counters feed the host's per-window work table. With no probe installed
+    // (every production run) each call site is a null-check no-op.
+    /** Counter keys for full static bakes, indexed by LOD tier (I3). */
+    private static final String[] SPOT_BAKE_KEY = {"sp.bake.t0", "sp.bake.t1", "sp.bake.t2"};
+    private static final String[] POINT_BAKE_KEY = {"pt.bake.t0", "pt.bake.t1", "pt.bake.t2"};
+
+    private static void probeSection(String name)
+    {
+        ShadowBakeProbe p = ShadowEngine.bakeProbe();
+        if (p != null)
+        {
+            p.section(name);
+        }
+    }
+
+    private static void probeCount(String key, int amount)
+    {
+        ShadowBakeProbe p = ShadowEngine.bakeProbe();
+        if (p != null && amount != 0)
+        {
+            p.counter(key, amount);
+        }
+    }
+
     private ShadowBaker()
     {}
 
@@ -392,6 +419,8 @@ public final class ShadowBaker
         double fwdX = haveFwd ? cameraForward.x : 0.0;
         double fwdY = haveFwd ? cameraForward.y : 0.0;
         double fwdZ = haveFwd ? cameraForward.z : 0.0;
+
+        probeSection("bake-spot");
 
         // --- spotlights: one perspective atlas tile each ---
         // Iterate in priority order (perf C1): tiles + the static-bake budget go
@@ -591,6 +620,7 @@ public final class ShadowBaker
                 {
                     profSpotBakes++;
                 }
+                probeCount(SPOT_BAKE_KEY[tierForIndex(myTile, SPOT_TIER_END)], 1);
                 ShadowRenderer.beginSpot(myTile, lxD, lyD, lzD, dx, dy, dz, range, outerDeg, false, true);
                 if (entInRange > 0)
                 {
@@ -630,6 +660,7 @@ public final class ShadowBaker
                         {
                             profSpotBakes++;
                         }
+                        probeCount(SPOT_BAKE_KEY[tierForIndex(myTile, SPOT_TIER_END)], 1);
                         ShadowRenderer.beginSpot(myTile, lxD, lyD, lzD, dx, dy, dz, range, outerDeg, false, true);
                         if (staticInRangeScratch > 0)
                         {
@@ -726,6 +757,7 @@ public final class ShadowBaker
                     {
                         profSpotBakes++;
                     }
+                    probeCount(SPOT_BAKE_KEY[tierForIndex(myTile, SPOT_TIER_END)], 1);
                     ShadowRenderer.beginSpot(myTile, lxD, lyD, lzD, dx, dy, dz, range, outerDeg, true, true);
                     if (staticInRangeScratch > 0)
                     {
@@ -745,12 +777,14 @@ public final class ShadowBaker
                     releaseOldTile(spotTileOwner, id, prevTile, myTile);
                 }
                 SpotlightDepthAtlas.copyStaticToLive(myTile);
+                probeCount("sp.copy", 1);
                 if (dyn)
                 {
                     if (PROFILE)
                     {
                         profSpotOverlays++;
                     }
+                    probeCount("sp.dyn", 1);
                     ShadowRenderer.beginSpot(myTile, lxD, lyD, lzD, dx, dy, dz, range, outerDeg, false, false);
                     renderInRangeCone(CASTERS_DYNAMIC, tickDelta);
                     ShadowRenderer.endPass();
@@ -762,6 +796,11 @@ public final class ShadowBaker
                 if (PROFILE && dyn)
                 {
                     profSpotOverlays++;
+                }
+                probeCount("sp.clear", 1);
+                if (dyn)
+                {
+                    probeCount("sp.dyn", 1);
                 }
                 ShadowRenderer.beginSpot(myTile, lxD, lyD, lzD, dx, dy, dz, range, outerDeg, false, true);
                 if (dyn)
@@ -798,8 +837,10 @@ public final class ShadowBaker
         }
 
         // one batched pyramid + EVSM pass over every tile the spot loop dirtied (before the SSBO flush / Iris passes)
+        probeSection("bake-spot-filter");
         SpotShadowPyramid.flushDirty();
         SpotShadowEvsm.flushDirty();
+        probeSection("bake-point");
 
         // Give the point loop its own mandatory pool (C2): the spot and point
         // loops run sequentially, so a shared pool lets far spots (baked first)
@@ -943,6 +984,7 @@ public final class ShadowBaker
                 {
                     profPointBakes++;
                 }
+                probeCount(POINT_BAKE_KEY[tierForIndex(myBlock, POINT_TIER_END)], 1);
                 for (int face = 0; face < 6; face++)
                 {
                     ShadowRenderer.beginPointFace(myBlock, face, lxD, lyD, lzD, radius, false, true);
@@ -982,6 +1024,7 @@ public final class ShadowBaker
                         {
                             profPointBakes++;
                         }
+                        probeCount(POINT_BAKE_KEY[tierForIndex(myBlock, POINT_TIER_END)], 1);
                         for (int face = 0; face < 6; face++)
                         {
                             ShadowRenderer.beginPointFace(myBlock, face, lxD, lyD, lzD, radius, false, true);
@@ -1069,6 +1112,7 @@ public final class ShadowBaker
                     {
                         profPointBakes++;
                     }
+                    probeCount(POINT_BAKE_KEY[tierForIndex(myBlock, POINT_TIER_END)], 1);
                     for (int face = 0; face < 6; face++)
                     {
                         ShadowRenderer.beginPointFace(myBlock, face, lxD, lyD, lzD, radius, true, true);
@@ -1105,10 +1149,12 @@ public final class ShadowBaker
                 if (bakedStatic)
                 {
                     PointDepthAtlas.copyStaticToLive(myBlock);
+                    probeCount("pt.copy.f", 6);
                 }
                 else
                 {
                     int copyMask = dynNow | lastFaceDynamic.get(id);
+                    probeCount("pt.copy.f", Integer.bitCount(copyMask));
                     for (int face = 0; face < 6; face++)
                     {
                         if ((copyMask & (1 << face)) != 0)
@@ -1124,6 +1170,7 @@ public final class ShadowBaker
                     {
                         profPointOverlays++;
                     }
+                    probeCount("pt.dyn.f", Integer.bitCount(dynNow));
                     for (int face = 0; face < 6; face++)
                     {
                         if ((dynNow & (1 << face)) == 0)
@@ -1144,6 +1191,11 @@ public final class ShadowBaker
                 if (PROFILE && dyn)
                 {
                     profPointOverlays++;
+                }
+                probeCount("pt.clear.f", 6);
+                if (dyn)
+                {
+                    probeCount("pt.dyn.f", Integer.bitCount(dynFaceMaskScratch));
                 }
                 for (int face = 0; face < 6; face++)
                 {
@@ -1177,8 +1229,10 @@ public final class ShadowBaker
         }
 
         // one batched pyramid + EVSM pass over every block the point loop dirtied (before the SSBO flush / Iris passes)
+        probeSection("bake-point-filter");
         PointShadowPyramid.flushDirty();
         PointShadowEvsm.flushDirty();
+        probeSection("bake-tail");
 
         if (PROFILE)
         {

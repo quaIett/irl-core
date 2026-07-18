@@ -250,6 +250,12 @@ public final class PointShadowEvsm
             return; // inert on failure — the GLSL size gate falls back to the PCF path
         }
 
+        ShadowBakeProbe probe = ShadowEngine.bakeProbe();
+        if (probe != null)
+        {
+            probe.counter("evsm.pt", Long.bitCount(mask));
+        }
+
         int prevProgram = GL11.glGetInteger(GL20.GL_CURRENT_PROGRAM);
         int unit = GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE) - GL13.GL_TEXTURE0;
         int prevTex = GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D);
