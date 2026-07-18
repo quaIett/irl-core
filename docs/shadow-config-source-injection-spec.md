@@ -133,7 +133,7 @@ public interface ShadowConfig {
 | `shadowBakeBudget()` | `4` | any int; `<= 0` ⇒ unlimited |
 | `shadowBlocks()` | `true` | — |
 | `shadowBlockRadius()` | `24` | blocks; `> 0` |
-| `shadowPoseReach()` | `0.9` | `>= 0` (addon UI slider `0..2`); interface `default`, NOT duplicated per-mod; NaN/negative sanitized at the read site |
+| `shadowPoseReach()` | `1.0` | `>= 0` (addon UI slider `0..4`); UNCAPPED slack on BOTH axes, every caster incl. model-block spheres — oversized values degrade to full-tile via coversMost; interface `default`, NOT duplicated per-mod; NaN/negative sanitized at the read site; default calibrated 2026-07-19 (0.9 nicked a stretched model block) |
 
 These defaults are identical in `LightConfig` (redactor, mutable static fields)
 and `IrliteConfig` (addon, null-safe BBS `Value*` fallbacks) today. Core SHALL

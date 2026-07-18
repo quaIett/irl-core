@@ -67,9 +67,8 @@ public final class ShadowBaker
     /** Horizontal half-DIAGONAL of the caster's own (unposed) box footprint,
      *  0.5*hypot(ex,ez)*scale, NO margin — the yaw-invariant tight bound the
      *  spot dyn-rect AABB is built from ({@link #computeSpotDynRect}); the
-     *  raw-sphere emit path stores the full radius here so the AABB
-     *  degenerates to exactly the sphere box. Cull still consumes only
-     *  {@link #orad}. */
+     *  raw-sphere emit path stores the full radius here (sphere box + slack).
+     *  Cull still consumes only {@link #orad}. */
     private static final float[] orh = new float[MAX_OCCLUDERS];
     /** Vertical half-extent (ey*0.5)*scale, NO margin; sphere path = radius. */
     private static final float[] ohv = new float[MAX_OCCLUDERS];
@@ -152,6 +151,22 @@ public final class ShadowBaker
     /** Kill switch for the partial-tile spot overlay (copy/scissor/filter
      *  rects): -Dirlite.noPartialFilter=true restores the full-tile paths. */
     private static final boolean NO_PARTIAL = Boolean.getBoolean("irlite.noPartialFilter");
+
+    /** Diagnostic bisect of the partial-tile path
+     *  (-Dirlite.partialFullFilters=true): keeps the dynamic depth draws
+     *  scissored to the projected rect but forces every static->live copy and
+     *  pyramid/EVSM refilter back to the full tile. Splits "the scissor clips
+     *  the silhouette" (still clipped with this on) from "the partial filter
+     *  rects miss texels the sampler reads" (clean with this on). */
+    private static final boolean PARTIAL_FULL_FILTERS = Boolean.getBoolean("irlite.partialFullFilters");
+
+    /** Diagnostic overlay of the dyn rect itself
+     *  (-Dirlite.dynRectDebug=true): fills the scissored rect's depth with
+     *  the near plane, so the rect appears in the world as a solid shadowed
+     *  block of the spot's light — shows exactly where the rect lands
+     *  relative to the caster it must cover. Combine with
+     *  partialFullFilters so the filters can't hide it. */
+    private static final boolean DYNRECT_DEBUG = Boolean.getBoolean("irlite.dynRectDebug");
 
     /** Scratch for {@link #computeSpotDynRect} (render thread only). */
     private static final Matrix4f dynRectMatrix = new Matrix4f();
@@ -839,7 +854,7 @@ public final class ShadowBaker
                     dynRect = computeSpotDynRect(lx, ly, lz, lxD, lyD, lzD,
                         ndx, ndy, ndz, cone, range, outerDeg, ts);
                 }
-                long copyRect = bakedStatic ? ShadowRect.FULL
+                long copyRect = (bakedStatic || PARTIAL_FULL_FILTERS) ? ShadowRect.FULL
                     : ShadowRect.union(dynRect, lastDynRect.containsKey(id) ? lastDynRect.get(id) : ShadowRect.FULL);
                 if (copyRect != ShadowRect.FULL && ShadowRect.coversMost(copyRect, ts, COVERS_MOST_NUM, COVERS_MOST_DEN))
                 {
@@ -875,6 +890,10 @@ public final class ShadowBaker
                             ShadowRect.x0(dynRect), ShadowRect.y0(dynRect),
                             ShadowRect.x1(dynRect) - ShadowRect.x0(dynRect),
                             ShadowRect.y1(dynRect) - ShadowRect.y0(dynRect));
+                        if (DYNRECT_DEBUG)
+                        {
+                            ShadowRenderer.debugFillScissoredDepth();
+                        }
                     }
                     renderInRangeCone(CASTERS_DYNAMIC, tickDelta);
                     ShadowRenderer.endPass();
@@ -2028,17 +2047,16 @@ public final class ShadowBaker
      * round((float) light), eye = L - A, same up rule, NEAR 0.05, aspect 1 —
      * a convex box in front of the near plane projects inside the convex hull
      * of its 8 projected corners, so the AABB bounds the depth writes
-     * conservatively. The AABB uses the caster's REAL per-axis half-extents
-     * ({@link #orh}/{@link #ohv}) instead of the cull sphere: horizontal =
-     * footprint half-diagonal + pose slack (animated limbs reach past the
-     * emitted hitbox, {@link ShadowConfig#shadowPoseReach()} — a live user
-     * knob), vertical = half-height +
-     * OVERLAP_MARGIN, both capped by the sphere radius — so the box never
-     * exceeds the sphere box that INVARIANT 5 pins as the outer bound, and
-     * the raw-sphere emit path (rh==hv==rad) reproduces it exactly. The
-     * scissor set from this rect is the HARD bound for those writes, so an
-     * under-estimate degrades to visible silhouette clipping, never to the
-     * filters missing fresh depth.
+     * conservatively. Every caster uses its REAL per-axis half-extents
+     * ({@link #orh}/{@link #ohv}; the raw-sphere path stores the radius in
+     * both) plus a pose/oversize slack on both axes ({@link
+     * ShadowConfig#shadowPoseReach()}, a live user knob, deliberately
+     * UNCAPPED): sources bound casters by their HITBOX while BBS content
+     * routinely draws past it (wide poses, stretched form models), so the
+     * knob must be able to outgrow the hitbox's cull sphere in any
+     * direction. The scissor set from this rect is the HARD bound for those
+     * writes, so an under-estimate degrades to visible silhouette clipping,
+     * never to the filters missing fresh depth.
      */
     private static long computeSpotDynRect(float lx, float ly, float lz,
                                            double lxD, double lyD, double lzD,
@@ -2073,7 +2091,7 @@ public final class ShadowBaker
         float poseReach = ShadowEngine.config().shadowPoseReach();
         if (!(poseReach >= 0f))
         {
-            poseReach = 0.9f;
+            poseReach = 1.0f;
         }
         float minU = Float.POSITIVE_INFINITY, minV = Float.POSITIVE_INFINITY;
         float maxU = Float.NEGATIVE_INFINITY, maxV = Float.NEGATIVE_INFINITY;
@@ -2087,9 +2105,17 @@ public final class ShadowBaker
             }
             any = true;
             float cx = ox[k] - axi, cy = oy[k] - ayi, cz = oz[k] - azi;
-            float rad = orad[k];
-            float hh = Math.min(orh[k] + Math.max(OVERLAP_MARGIN, poseReach * ohv[k]), rad);
-            float hy = Math.min(ohv[k] + OVERLAP_MARGIN, rad);
+            // Real per-axis half-extents + pose/oversize slack on BOTH axes,
+            // deliberately UNCAPPED: sources bound casters by their HITBOX
+            // (entity box, form hitbox — including the model-block sphere,
+            // where rh==hv==radius), and BBS content routinely DRAWS past it
+            // — wide animation poses, stretched/oversized form models. The
+            // knob must be able to outgrow the hitbox's cull sphere in any
+            // direction; an oversized box just degrades to FULL via the
+            // coversMost gate (= the old full-tile behavior).
+            float slack = Math.max(OVERLAP_MARGIN, poseReach * ohv[k]);
+            float hh = orh[k] + slack;
+            float hy = ohv[k] + slack;
             for (int corner = 0; corner < 8; corner++)
             {
                 dynRectVec.set(
@@ -2209,7 +2235,10 @@ public final class ShadowBaker
                          float cx, float cy, float cz, float radius, long staticHash)
         {
             // No box to tighten from: per-axis half-extents fall back to the
-            // sphere radius, so the dyn-rect AABB is exactly the sphere box.
+            // sphere radius (the dyn-rect AABB becomes the sphere box + pose
+            // slack). The slack MUST apply here too: model-block spheres are
+            // built from the FORM HITBOX, and a stretched/oversized visual
+            // draws far outside them — the knob is the only guard.
             put(caster, type, isStatic, cx, cy, cz, radius, radius, radius, staticHash);
         }
     };

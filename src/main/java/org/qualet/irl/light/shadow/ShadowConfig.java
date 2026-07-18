@@ -44,21 +44,25 @@ public interface ShadowConfig
      *  per-light bbox walk. Default 24. */
     int shadowBlockRadius();
 
-    /** Horizontal pose slack of the partial-tile spot overlay's dyn-rect AABB,
-     *  as a fraction of the caster's half-height: sources emit the UNPOSED
-     *  hitbox, but an animated limb pivots near the body, so its reach past
-     *  that box is bounded by roughly the limb length (vanilla humanoid
-     *  sideways arm tip ~1.19 blocks off-center vs hitbox half-diagonal
-     *  ~0.42; 0.42 + 0.9*hv(0.9) = 1.23 covers it). The scissor cut from the
-     *  rect is a HARD bound — an under-estimate clips the silhouette visibly
-     *  — so RAISE this when wide poses / oversized forms show clipped shadow
-     *  edges; every axis stays capped by the caster's cull sphere, so large
-     *  values saturate at the pre-AABB sphere box (proven clip-free), they
-     *  only cost filter area. Pulled fresh every bake (live knob). OPTIONAL
-     *  (a {@code default}): mods that predate it keep compiling and get 0.9. */
+    /** Pose/oversize slack of the partial-tile spot overlay's dyn-rect AABB,
+     *  applied on BOTH axes as a fraction of the caster's half-height:
+     *  sources bound casters by their UNPOSED hitbox (entity box, form
+     *  hitbox — the model-block sphere included), but BBS content routinely
+     *  draws past it — an animated limb reaches roughly its own length
+     *  (vanilla humanoid sideways arm tip ~1.19 blocks off-center vs hitbox
+     *  half-diagonal ~0.42; 0.42 + 1.0*hv(0.9) = 1.32 covers it), and a
+     *  stretched form model can exceed the hitbox in any direction. The
+     *  scissor cut from the rect is a HARD bound — an under-estimate clips
+     *  the silhouette visibly — so RAISE this until clipped shadow edges
+     *  disappear. Deliberately UNCAPPED: large values must keep growing the
+     *  box past the hitbox's cull sphere — the only cost is filter area, and
+     *  an oversized box just degrades to the full-tile path via the
+     *  coversMost gate. Pulled fresh every bake (live knob). OPTIONAL (a
+     *  {@code default}): mods that predate it keep compiling and get 1.0
+     *  (calibrated 2026-07-19: 0.9 still nicked a stretched model block). */
     default float shadowPoseReach()
     {
-        return 0.9f;
+        return 1.0f;
     }
 
     /**
@@ -133,7 +137,7 @@ public interface ShadowConfig
         }
 
         /** OPTIONAL (unlike the five originals): omitted = the interface
-         *  default 0.9, so pre-existing shims keep building unchanged. */
+         *  default 1.0, so pre-existing shims keep building unchanged. */
         public Builder shadowPoseReach(DoubleSupplier shadowPoseReach)
         {
             this.shadowPoseReach = shadowPoseReach;
@@ -155,7 +159,7 @@ public interface ShadowConfig
                 public int shadowBakeBudget()  { return bakeBudget.getAsInt(); }
                 public boolean shadowBlocks()  { return blocks.getAsBoolean(); }
                 public int shadowBlockRadius() { return blockRadius.getAsInt(); }
-                public float shadowPoseReach() { return poseReach == null ? 0.9f : (float) poseReach.getAsDouble(); }
+                public float shadowPoseReach() { return poseReach == null ? 1.0f : (float) poseReach.getAsDouble(); }
             };
         }
 

@@ -198,6 +198,18 @@ public final class ShadowRenderer
         GL11.glScissor(px + localX, py + localY, w, h);
     }
 
+    /** DIAGNOSTIC (-Dirlite.dynRectDebug=true): clear the CURRENTLY SCISSORED
+     *  depth region to the near plane, making the partial-tile dyn rect show
+     *  up in the world as a fully-shadowed block of the spot's light — a
+     *  direct visual of where the rect actually lands relative to the caster
+     *  it is supposed to cover. Call right after {@link #restrictScissorSpot}. */
+    public static void debugFillScissoredDepth()
+    {
+        GL11.glClearDepth(0.0);
+        GL11.glClear(GL11.GL_DEPTH_BUFFER_BIT);
+        GL11.glClearDepth(1.0);
+    }
+
     /**
      * Begin a point-cube face depth pass into the live or static atlas (see
      * {@link #beginSpot} for the {@code toStatic}/{@code clear} semantics; the
