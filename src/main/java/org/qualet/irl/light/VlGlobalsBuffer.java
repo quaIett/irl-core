@@ -16,8 +16,8 @@ import java.nio.ByteBuffer;
  *   layout(std140, binding = BINDING) uniform IrliteVlGlobals {
  *       vec4 irlite_vlA;   // x = intensity, y = maxDist, z = tipBoost, w = tipRadius
  *       vec4 irlite_vlB;   // x = noiseAmount, y = noiseScale, z = noiseSpeed, w = frameIndex (wraps at 4096)
- *       uvec4 irlite_vlC;  // x = stepMax, y = shadowStride, z = noiseStride, w = flags (bit0 = VL shadows, bit1 = VL noise, bit2 = blue-noise dither, bit3 = temporal dither rotation, bit4 = VL cluster culling, bit5 = VL shadow Hi-Z segment skip)
- *       vec4 irlite_vlD;   // x = noiseMorph (0 = morph off), y/z/w = reserved0/1/2 (written as 0)
+ *       uvec4 irlite_vlC;  // x = stepMax, y = shadowStride, z = noiseStride, w = flags (bit0 = VL shadows, bit1 = VL noise, bit2 = blue-noise dither, bit3 = temporal dither rotation, bit4 = VL cluster culling, bit5 = VL shadow Hi-Z segment skip, bit6 = depth-aware bilateral upsample)
+ *       vec4 irlite_vlD;   // x = noiseMorph (0 = morph off), y = bilateral depth sigma in blocks (0 = shader default), z/w = reserved1/2 (written as 0)
  *   };
  */
 public final class VlGlobalsBuffer
@@ -43,7 +43,7 @@ public final class VlGlobalsBuffer
     private static int stepMax = 48;            // IRLITE_VL_STEPS 48
     private static int shadowStride = 2;        // IRLITE_VL_SHADOW_STRIDE 2
     private static int noiseStride = 2;         // IRLITE_VL_NOISE_STRIDE 2
-    private static int flags = 0x3F;            // bit0 = VL shadows, bit1 = VL noise, bit2 = blue-noise dither (default on), bit3 = temporal dither rotation (default on), bit4 = VL cluster culling (default on), bit5 = VL shadow Hi-Z segment skip (default on)
+    private static int flags = 0x7F;            // bit0 = VL shadows, bit1 = VL noise, bit2 = blue-noise dither (default on), bit3 = temporal dither rotation (default on), bit4 = VL cluster culling (default on), bit5 = VL shadow Hi-Z segment skip (default on), bit6 = depth-aware bilateral upsample (default on)
 
     /** Frame counter for the temporal dither rotation (flags bit3): written to
      *  irlite_vlB.w each upload, wrapped to 12 bits so the float stays exact.
@@ -108,7 +108,7 @@ public final class VlGlobalsBuffer
         scratch.putFloat(intensity).putFloat(maxDist).putFloat(tipBoost).putFloat(tipRadius);
         scratch.putFloat(noiseAmount).putFloat(noiseScale).putFloat(noiseSpeed).putFloat(frameIndex);  // w = frameIndex
         scratch.putInt(stepMax).putInt(shadowStride).putInt(noiseStride).putInt(flags);
-        scratch.putFloat(noiseMorph).putFloat(0F).putFloat(0F).putFloat(0F);  // vlD: x = noiseMorph, y/z/w reserved
+        scratch.putFloat(noiseMorph).putFloat(0F).putFloat(0F).putFloat(0F);  // vlD: x = noiseMorph, y = bilateral sigma (0 = shader default, no setter yet), z/w reserved
         scratch.flip();
 
         frameIndex = (frameIndex + 1) & 4095;   // one tick per upload = per frame
