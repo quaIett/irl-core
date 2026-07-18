@@ -39,7 +39,7 @@ public final class VlGlobalsBuffer
     private static float noiseAmount = 0.6F;    // IRLITE_VL_NOISE_AMOUNT 0.6
     private static float noiseScale = 2F;       // IRLITE_VL_NOISE_SCALE 2.0
     private static float noiseSpeed = 0.25F;    // IRLITE_VL_NOISE_SPEED 0.25
-    private static float noiseMorph = 1F;       // runtime-only knob (no compile-time define): fog puff reshape speed
+    private static float noiseMorph = 0F;       // runtime-only knob (no compile-time define): fog puff reshape speed; 0 = off (a second noise tap per refresh — measured pricier than the noise itself)
     private static int stepMax = 48;            // IRLITE_VL_STEPS 48
     private static int shadowStride = 2;        // IRLITE_VL_SHADOW_STRIDE 2
     private static int noiseStride = 2;         // IRLITE_VL_NOISE_STRIDE 2
