@@ -43,16 +43,28 @@ import org.lwjgl.opengl.GL43;
 public final class SpotShadowEvsm
 {
     private static int texId = 0;      // EVSM atlas: base = atlas >> shift, levels = log2(tileSize) - shift + 1
-    private static int tempId = 0;     // one tile region (tileSize >> shift)^2, ping-pong for the separable blur
+    private static int tempId = 0;     // one tile region (tileSize >> shift)^2, blur H output / V input
+    /** Raw (unblurred) reduce output, one tile region like {@link #tempId}.
+     *  The chain always runs reduce->scratch, H: scratch->temp, V: temp->mip —
+     *  the mip levels never hold raw moments, so a partial-rect pass leaves
+     *  every out-of-rect mip texel byte-stable (an in-place convert would
+     *  smear blur-of-blur along the rect edge instead). Full-tile frames pay
+     *  nothing: it is the same three dispatches the in-place pipeline used. */
+    private static int scratchId = 0;
     private static int levels = 0;
     private static int progConvert = 0, progBlur = 0, progMip = 0;
     private static int uCvSrc, uCvFar, uCvStep, uCvSrcOrigin, uCvDstOrigin, uCvDstSize;
-    private static int uBlSrc, uBlSrcLod, uBlHorizontal, uBlSrcOrigin, uBlDstOrigin, uBlSize;
+    private static int uBlSrc, uBlSrcLod, uBlHorizontal, uBlSrcOrigin, uBlDstOrigin, uBlSize, uBlClampMax;
     private static int uMpSrc, uMpSrcLod, uMpSrcOrigin, uMpDstOrigin, uMpDstSize;
     private static boolean programsAttempted = false;
     /** One bit per flat atlas tile (1L << tile); long because the quadtree
      *  layout allows up to 64 tiles (guarded in SpotlightDepthAtlas). */
     private static long dirtyMask = 0L;
+    /** Per-tile dirty sub-rect in TILE-LOCAL depth pixels ({@link ShadowRect};
+     *  FULL = whole region). Snapshot + reset strictly together with
+     *  {@link #dirtyMask} in {@link #flushDirty} (see SpotShadowPyramid). */
+    private static final long[] dirtyRect = new long[SpotlightDepthAtlas.tileCount()];
+    private static final long[] flushRect = new long[SpotlightDepthAtlas.tileCount()];
     private static final float[] tileFar = new float[SpotlightDepthAtlas.tileCount()]; // light range per dirty tile (linear depth metric)
 
     private static final String COMMON =
@@ -90,15 +102,22 @@ public final class SpotShadowEvsm
         "    imageStore(dst, dstOrigin + g, m / float(srcStep * srcStep));\n" +
         "}\n";
 
-    // separable Gaussian 1-4-6-4-1, reads clamped inside the tile region (no cross-tile bleed);
-    // runs on EVERY mip level after its downsample so the filter width actually doubles per lod
+    // separable Gaussian 1-4-6-4-1; reads clamp to [0, clampMax] in SOURCE-local
+    // coords (scratch/temp extents — which coincide with the tile region edge on
+    // full-tile passes, so there is still no cross-tile bleed). The dispatch
+    // rect ("size", the written extent) is DECOUPLED from the clamp bound: a
+    // partial V pass writes a rect inset inside the scratch extents and must
+    // read its 2-texel apron beyond the write rect instead of clamping at it.
+    // Runs on EVERY mip level after its downsample so the filter width
+    // actually doubles per lod.
     private static final String BLUR_SRC = COMMON +
         "uniform sampler2D srcTex;\n" +
-        "uniform int srcLod;\n" +               // EVSM mip being blurred (0 when reading the temp)
-        "uniform int horizontal;\n" +           // 1: read EVSM mip (absolute), write temp (local); 0: read temp (local), write EVSM mip (absolute)
+        "uniform int srcLod;\n" +               // always 0 in the scratch pipeline (scratch/temp are single-level)
+        "uniform int horizontal;\n" +           // 1: read scratch (raw), write temp; 0: read temp, write EVSM mip (absolute)
         "uniform ivec2 srcOrigin;\n" +
         "uniform ivec2 dstOrigin;\n" +
-        "uniform ivec2 size;\n" +               // tile region size at this lod
+        "uniform ivec2 size;\n" +               // written rect extent at this lod
+        "uniform ivec2 clampMax;\n" +           // inclusive source-local clamp bound (source extents - 1)
         "const float W[5] = float[5](0.0625, 0.25, 0.375, 0.25, 0.0625);\n" +
         "void main()\n" +
         "{\n" +
@@ -107,9 +126,8 @@ public final class SpotShadowEvsm
         "    vec4 acc = vec4(0.0);\n" +
         "    for (int k = -2; k <= 2; k++)\n" +
         "    {\n" +
-        "        ivec2 o = (horizontal == 1) ? ivec2(clamp(g.x + k, 0, size.x - 1), g.y)\n" +
-        "                                    : ivec2(g.x, clamp(g.y + k, 0, size.y - 1));\n" +
-        "        acc += W[k + 2] * texelFetch(srcTex, srcOrigin + o, srcLod);\n" +
+        "        ivec2 o = (horizontal == 1) ? ivec2(g.x + k, g.y) : ivec2(g.x, g.y + k);\n" +
+        "        acc += W[k + 2] * texelFetch(srcTex, clamp(srcOrigin + o, ivec2(0), clampMax), srcLod);\n" +
         "    }\n" +
         "    imageStore(dst, dstOrigin + g, acc);\n" +
         "}\n";
@@ -148,8 +166,23 @@ public final class SpotShadowEvsm
         if (tile >= 0 && tile < SpotlightDepthAtlas.tileCount())
         {
             dirtyMask |= 1L << tile;
+            dirtyRect[tile] = ShadowRect.FULL;
             tileFar[tile] = Math.max(range, 0.1f);
         }
+    }
+
+    /** Partial-tile variant: only the given TILE-LOCAL depth-pixel rect of the
+     *  live depth changed. Unions with any rect already marked this frame;
+     *  {@link #markDirty} forces FULL. */
+    public static void markDirtyRect(int tile, long rect, float range)
+    {
+        if (tile < 0 || tile >= SpotlightDepthAtlas.tileCount())
+        {
+            return;
+        }
+        dirtyRect[tile] = (dirtyMask & (1L << tile)) != 0 ? ShadowRect.union(dirtyRect[tile], rect) : rect;
+        dirtyMask |= 1L << tile;
+        tileFar[tile] = Math.max(range, 0.1f);
     }
 
     /** Convert + blur + mip every dirty tile in one batch. Call once per bake,
@@ -162,6 +195,7 @@ public final class SpotShadowEvsm
         }
         long mask = dirtyMask;
         dirtyMask = 0L;
+        System.arraycopy(dirtyRect, 0, flushRect, 0, dirtyRect.length);
         int depthTex = SpotlightDepthAtlas.getGlTextureId();
         if (depthTex == 0)
         {
@@ -198,6 +232,17 @@ public final class SpotShadowEvsm
         // shift = the EVSM base's extra right-shift below the depth atlas
         // (1 = atlas/2, 2 = ULTRA's atlas/4); a shift change deletes the
         // textures (setEvsmShift), so the allocation always matches it.
+        //
+        // SCRATCH PIPELINE, per tile per lod (identical for FULL and rect):
+        //   reduce (depth convert at lod 0 / mip downsample deeper) -> scratch
+        //   H blur: scratch -> temp,  V blur: temp -> EVSM mip (write rect W).
+        // Rects, all in region-local lod-L texels: W = affected outputs =
+        // changed-content rect C grown by the Gaussian radius 2; S = W grown
+        // by 2 more = the raw support H/V read (clamped to the region, where
+        // the scratch edge coincides with the tile edge and the kernel clamp
+        // reproduces the old cross-tile-bleed-free behavior byte for byte).
+        // Next level's C = W halved (floor/ceil) — the recurrence keeps every
+        // out-of-rect mip texel untouched while covering every affected one.
         int shift = SpotlightDepthAtlas.evsmShift();
         for (int tile = 0; tile < SpotlightDepthAtlas.tileCount(); tile++)
         {
@@ -207,77 +252,103 @@ public final class SpotShadowEvsm
             }
             int pixX = SpotlightDepthAtlas.tilePixelX(tile);
             int pixY = SpotlightDepthAtlas.tilePixelY(tile);
-            int base = SpotlightDepthAtlas.tileSizePx(tile) >> shift; // tile region width at EVSM lod 0
-            if (base == 0)
+            int ts = SpotlightDepthAtlas.tileSizePx(tile);
+            if (ts >> shift == 0)
             {
                 continue; // degenerate sub-tile smaller than the base step — nothing to filter
             }
-            int ox = pixX >> shift, oy = pixY >> shift;
 
-            // convert: depth -> linearized warped moments, EVSM mip0 (tile region)
-            GlStateManager._glUseProgram(progConvert);
-            GL20.glUniform1i(uCvSrc, unit);
-            GL20.glUniform1f(uCvFar, tileFar[tile]);
-            GL20.glUniform1i(uCvStep, 1 << shift);
-            GlStateManager._bindTexture(depthTex);
-            GL42.glBindImageTexture(0, texId, 0, false, 0, GL15.GL_WRITE_ONLY, GL30.GL_RGBA32F);
-            GL20.glUniform2i(uCvSrcOrigin, pixX, pixY);
-            GL20.glUniform2i(uCvDstOrigin, ox, oy);
-            GL20.glUniform2i(uCvDstSize, base, base);
-            GL43.glDispatchCompute((base + 7) / 8, (base + 7) / 8, 1);
-            GL42.glMemoryBarrier(GL42.GL_TEXTURE_FETCH_BARRIER_BIT);
-
-            blurTileLevel(unit, 0, ox, oy, base);
-        }
-
-        // mip chain: downsample all dirty tiles at level L, then re-blur each tile at L
-        // (a bare 2x2-avg chain does NOT double the filter width per lod — reviewed fix)
-        for (int lod = 1; lod < levels; lod++)
-        {
-            GlStateManager._glUseProgram(progMip);
-            GL20.glUniform1i(uMpSrc, unit);
-            GlStateManager._bindTexture(texId);
-            GL20.glUniform1i(uMpSrcLod, lod - 1);
-            GL42.glBindImageTexture(0, texId, lod, false, 0, GL15.GL_WRITE_ONLY, GL30.GL_RGBA32F);
-            for (int tile = 0; tile < SpotlightDepthAtlas.tileCount(); tile++)
+            // Changed-content rect at lod 0, region-local texels (depth >> shift).
+            long r = flushRect[tile];
+            int cx0, cy0, cx1, cy1;
+            int region0 = ts >> shift;
+            if (r == ShadowRect.FULL)
             {
-                if ((mask & (1L << tile)) == 0L)
-                {
-                    continue;
-                }
-                int pixX = SpotlightDepthAtlas.tilePixelX(tile);
-                int pixY = SpotlightDepthAtlas.tilePixelY(tile);
-                int dstW = SpotlightDepthAtlas.tileSizePx(tile) >> (lod + shift);
-                if (dstW == 0)
-                {
-                    // A sub-tile's chain ends at one texel per sub-tile — a
-                    // deeper lod would mix neighbouring tiles. Full-size tiles
-                    // (the whole degenerate layout) never hit this: levels =
-                    // log2(tileSize) - shift + 1 already bottoms them out at
-                    // one texel.
-                    continue;
-                }
-                GL20.glUniform2i(uMpSrcOrigin, pixX >> (lod + shift - 1), pixY >> (lod + shift - 1));
-                GL20.glUniform2i(uMpDstOrigin, pixX >> (lod + shift), pixY >> (lod + shift));
-                GL20.glUniform2i(uMpDstSize, dstW, dstW);
-                GL43.glDispatchCompute((dstW + 7) / 8, (dstW + 7) / 8, 1);
+                cx0 = 0; cy0 = 0; cx1 = region0; cy1 = region0;
             }
-            GL42.glMemoryBarrier(GL42.GL_TEXTURE_FETCH_BARRIER_BIT);
-            for (int tile = 0; tile < SpotlightDepthAtlas.tileCount(); tile++)
+            else
             {
-                if ((mask & (1L << tile)) == 0L)
+                int step = 1 << shift;
+                cx0 = Math.min(region0 - 1, ShadowRect.x0(r) / step);
+                cy0 = Math.min(region0 - 1, ShadowRect.y0(r) / step);
+                cx1 = Math.min(region0, (ShadowRect.x1(r) + step - 1) / step);
+                cy1 = Math.min(region0, (ShadowRect.y1(r) + step - 1) / step);
+            }
+
+            for (int lod = 0; lod < levels; lod++)
+            {
+                int region = ts >> (lod + shift);
+                if (region == 0)
                 {
-                    continue;
+                    break; // past this sub-tile's chain end (see the levels formula)
                 }
-                int dstW = SpotlightDepthAtlas.tileSizePx(tile) >> (lod + shift);
-                if (dstW < 2)
+                // W = outputs to rewrite (C + blur radius 2); S = raw support (W + 2).
+                int wx0 = Math.max(0, cx0 - 2), wy0 = Math.max(0, cy0 - 2);
+                int wx1 = Math.min(region, cx1 + 2), wy1 = Math.min(region, cy1 + 2);
+                int sx0 = Math.max(0, wx0 - 2), sy0 = Math.max(0, wy0 - 2);
+                int sx1 = Math.min(region, wx1 + 2), sy1 = Math.min(region, wy1 + 2);
+                int sW = sx1 - sx0, sH = sy1 - sy0;
+                int wW = wx1 - wx0, wH = wy1 - wy0;
+                int regOrigX = pixX >> (lod + shift), regOrigY = pixY >> (lod + shift);
+
+                // reduce -> scratch (raw moments, scratch-local at (0,0))
+                if (lod == 0)
                 {
-                    continue; // 1-texel region: a 5-tap blur adds nothing (and a 0-texel one is past the chain's end)
+                    GlStateManager._glUseProgram(progConvert);
+                    GL20.glUniform1i(uCvSrc, unit);
+                    GL20.glUniform1f(uCvFar, tileFar[tile]);
+                    GL20.glUniform1i(uCvStep, 1 << shift);
+                    GlStateManager._bindTexture(depthTex);
+                    GL42.glBindImageTexture(0, scratchId, 0, false, 0, GL15.GL_WRITE_ONLY, GL30.GL_RGBA32F);
+                    GL20.glUniform2i(uCvSrcOrigin, pixX + (sx0 << shift), pixY + (sy0 << shift));
+                    GL20.glUniform2i(uCvDstOrigin, 0, 0);
+                    GL20.glUniform2i(uCvDstSize, sW, sH);
                 }
-                blurTileLevel(unit, lod,
-                    SpotlightDepthAtlas.tilePixelX(tile) >> (lod + shift),
-                    SpotlightDepthAtlas.tilePixelY(tile) >> (lod + shift),
-                    dstW);
+                else
+                {
+                    GlStateManager._glUseProgram(progMip);
+                    GL20.glUniform1i(uMpSrc, unit);
+                    GlStateManager._bindTexture(texId);
+                    GL20.glUniform1i(uMpSrcLod, lod - 1);
+                    GL42.glBindImageTexture(0, scratchId, 0, false, 0, GL15.GL_WRITE_ONLY, GL30.GL_RGBA32F);
+                    GL20.glUniform2i(uMpSrcOrigin, (regOrigX << 1) + (sx0 << 1), (regOrigY << 1) + (sy0 << 1));
+                    GL20.glUniform2i(uMpDstOrigin, 0, 0);
+                    GL20.glUniform2i(uMpDstSize, sW, sH);
+                }
+                GL43.glDispatchCompute((sW + 7) / 8, (sH + 7) / 8, 1);
+                GL42.glMemoryBarrier(GL42.GL_TEXTURE_FETCH_BARRIER_BIT);
+
+                // H: scratch -> temp over the whole S rect (edge H outputs whose
+                // kernel clamps at an interior S edge are never consumed: V only
+                // reads columns of W, inset >= 2 from S's x-edges by construction)
+                GlStateManager._glUseProgram(progBlur);
+                GL20.glUniform1i(uBlSrc, unit);
+                GL20.glUniform1i(uBlSrcLod, 0);
+                GL20.glUniform2i(uBlClampMax, sW - 1, sH - 1);
+                GlStateManager._bindTexture(scratchId);
+                GL42.glBindImageTexture(0, tempId, 0, false, 0, GL15.GL_WRITE_ONLY, GL30.GL_RGBA32F);
+                GL20.glUniform1i(uBlHorizontal, 1);
+                GL20.glUniform2i(uBlSrcOrigin, 0, 0);
+                GL20.glUniform2i(uBlDstOrigin, 0, 0);
+                GL20.glUniform2i(uBlSize, sW, sH);
+                GL43.glDispatchCompute((sW + 7) / 8, (sH + 7) / 8, 1);
+                GL42.glMemoryBarrier(GL42.GL_TEXTURE_FETCH_BARRIER_BIT);
+
+                // V: temp -> EVSM mip, write rect W only (absolute dst origin)
+                GlStateManager._bindTexture(tempId);
+                GL42.glBindImageTexture(0, texId, lod, false, 0, GL15.GL_WRITE_ONLY, GL30.GL_RGBA32F);
+                GL20.glUniform1i(uBlHorizontal, 0);
+                GL20.glUniform2i(uBlSrcOrigin, wx0 - sx0, wy0 - sy0);
+                GL20.glUniform2i(uBlDstOrigin, regOrigX + wx0, regOrigY + wy0);
+                GL20.glUniform2i(uBlSize, wW, wH);
+                GL43.glDispatchCompute((wW + 7) / 8, (wH + 7) / 8, 1);
+                GL42.glMemoryBarrier(GL42.GL_TEXTURE_FETCH_BARRIER_BIT);
+
+                // Next level's changed content = this level's write rect, halved.
+                cx0 = wx0 >> 1;
+                cy0 = wy0 >> 1;
+                cx1 = (wx1 + 1) >> 1;
+                cy1 = (wy1 + 1) >> 1;
             }
         }
 
@@ -291,36 +362,6 @@ public final class SpotShadowEvsm
         {
             GL42.glBindImageTexture(0, prevImgName, prevImgLevel, prevImgLayered != 0, prevImgLayer, prevImgAccess, prevImgFormat);
         }
-    }
-
-    /** Separable Gaussian on one tile's region of EVSM mip {@code lod} via the
-     *  temp texture. Caller guarantees the mip content is fetch-visible. */
-    private static void blurTileLevel(int unit, int lod, int ox, int oy, int w)
-    {
-        int groups = (w + 7) / 8;
-        GlStateManager._glUseProgram(progBlur);
-        GL20.glUniform1i(uBlSrc, unit);
-        GL20.glUniform2i(uBlSize, w, w);
-
-        // H: EVSM mip -> temp (local coords)
-        GlStateManager._bindTexture(texId);
-        GL42.glBindImageTexture(0, tempId, 0, false, 0, GL15.GL_WRITE_ONLY, GL30.GL_RGBA32F);
-        GL20.glUniform1i(uBlSrcLod, lod);
-        GL20.glUniform1i(uBlHorizontal, 1);
-        GL20.glUniform2i(uBlSrcOrigin, ox, oy);
-        GL20.glUniform2i(uBlDstOrigin, 0, 0);
-        GL43.glDispatchCompute(groups, groups, 1);
-        GL42.glMemoryBarrier(GL42.GL_TEXTURE_FETCH_BARRIER_BIT);
-
-        // V: temp -> EVSM mip (the barrier above also orders this store after the H-pass fetches of the same mip)
-        GlStateManager._bindTexture(tempId);
-        GL42.glBindImageTexture(0, texId, lod, false, 0, GL15.GL_WRITE_ONLY, GL30.GL_RGBA32F);
-        GL20.glUniform1i(uBlSrcLod, 0);
-        GL20.glUniform1i(uBlHorizontal, 0);
-        GL20.glUniform2i(uBlSrcOrigin, 0, 0);
-        GL20.glUniform2i(uBlDstOrigin, ox, oy);
-        GL43.glDispatchCompute(groups, groups, 1);
-        GL42.glMemoryBarrier(GL42.GL_TEXTURE_FETCH_BARRIER_BIT);
     }
 
     private static void ensureResources()
@@ -348,6 +389,7 @@ public final class SpotShadowEvsm
                 uBlSrcOrigin = GL20.glGetUniformLocation(progBlur, "srcOrigin");
                 uBlDstOrigin = GL20.glGetUniformLocation(progBlur, "dstOrigin");
                 uBlSize = GL20.glGetUniformLocation(progBlur, "size");
+                uBlClampMax = GL20.glGetUniformLocation(progBlur, "clampMax");
             }
             if (progMip != 0)
             {
@@ -382,19 +424,27 @@ public final class SpotShadowEvsm
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL12.GL_TEXTURE_BASE_LEVEL, 0);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL12.GL_TEXTURE_MAX_LEVEL, levels - 1);
 
-        tempId = GlStateManager._genTexture();
-        GlStateManager._bindTexture(tempId);
-        // Sized for the LARGEST tile's lod-0 region (tileSize >> shift)^2;
-        // every quadtree sub-tile region at every lod is smaller, so it fits.
-        GL42.glTexStorage2D(GL11.GL_TEXTURE_2D, 1, GL30.GL_RGBA32F,
-            Math.max(1, SpotlightDepthAtlas.getTileSize() >> shift),
-            Math.max(1, SpotlightDepthAtlas.getTileSize() >> shift));
+        // temp (H output / V input) and scratch (raw reduce output), both sized
+        // for the LARGEST tile's lod-0 region (tileSize >> shift)^2; every
+        // quadtree sub-tile region — and every partial S rect — at every lod
+        // is smaller, so they always fit.
+        int side = Math.max(1, SpotlightDepthAtlas.getTileSize() >> shift);
+        tempId = allocScratch(side);
+        scratchId = allocScratch(side);
+
+        GlStateManager._bindTexture(prevTex);
+    }
+
+    private static int allocScratch(int side)
+    {
+        int id = GlStateManager._genTexture();
+        GlStateManager._bindTexture(id);
+        GL42.glTexStorage2D(GL11.GL_TEXTURE_2D, 1, GL30.GL_RGBA32F, side, side);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL12.GL_TEXTURE_BASE_LEVEL, 0);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL12.GL_TEXTURE_MAX_LEVEL, 0);
-
-        GlStateManager._bindTexture(prevTex);
+        return id;
     }
 
     private static int buildProgram(String src, String tag)
@@ -434,6 +484,11 @@ public final class SpotShadowEvsm
         {
             GlStateManager._deleteTexture(tempId);
             tempId = 0;
+        }
+        if (scratchId != 0)
+        {
+            GlStateManager._deleteTexture(scratchId);
+            scratchId = 0;
         }
         levels = 0;
         dirtyMask = 0L;

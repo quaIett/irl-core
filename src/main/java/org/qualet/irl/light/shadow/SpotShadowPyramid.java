@@ -45,6 +45,14 @@ public final class SpotShadowPyramid
     /** One bit per flat atlas tile (1L << tile); long because the quadtree
      *  layout allows up to 64 tiles (guarded in SpotlightDepthAtlas). */
     private static long dirtyMask = 0L;
+    /** Per-tile dirty sub-rect in TILE-LOCAL depth pixels, packed
+     *  x0<<48|y0<<32|x1<<16|y1 (x1/y1 exclusive); {@link ShadowRect#FULL}
+     *  = rebuild the whole tile region (the pre-partial behavior). Snapshot +
+     *  reset in {@link #flushDirty} strictly together with {@link #dirtyMask}
+     *  (the mask is consumed even on the depthTex==0 early-out — a
+     *  mask/rect desync would flush a full-marked tile partially). */
+    private static final long[] dirtyRect = new long[SpotlightDepthAtlas.tileCount()];
+    private static final long[] flushRect = new long[SpotlightDepthAtlas.tileCount()];
 
     private static final String COMPUTE_SRC =
         "#version 430 core\n" +
@@ -97,7 +105,21 @@ public final class SpotShadowPyramid
         if (tile >= 0 && tile < SpotlightDepthAtlas.tileCount())
         {
             dirtyMask |= 1L << tile;
+            dirtyRect[tile] = ShadowRect.FULL;
         }
+    }
+
+    /** Partial-tile variant: only the given TILE-LOCAL depth-pixel rect of the
+     *  live depth changed (overlay copy + dynamic draws). Unions with any rect
+     *  already marked this frame; {@link #markDirty} forces FULL. */
+    public static void markDirtyRect(int tile, long rect)
+    {
+        if (tile < 0 || tile >= SpotlightDepthAtlas.tileCount())
+        {
+            return;
+        }
+        dirtyRect[tile] = (dirtyMask & (1L << tile)) != 0 ? ShadowRect.union(dirtyRect[tile], rect) : rect;
+        dirtyMask |= 1L << tile;
     }
 
     /** Rebuild every dirty tile's pyramid region from the LIVE atlas depth in
@@ -111,6 +133,7 @@ public final class SpotShadowPyramid
         }
         long mask = dirtyMask;
         dirtyMask = 0L;
+        System.arraycopy(dirtyRect, 0, flushRect, 0, dirtyRect.length);
         int depthTex = SpotlightDepthAtlas.getGlTextureId();
         if (depthTex == 0)
         {
@@ -151,7 +174,10 @@ public final class SpotShadowPyramid
         // tileSizePx, so shifting origin and size right in lockstep is exact at
         // every lod (no fractional texel ever appears).
 
-        // pass 0: depth atlas -> pyramid lod 0, all dirty tiles, one barrier
+        // pass 0: depth atlas -> pyramid lod 0, all dirty tiles, one barrier.
+        // Per-tile rect: the min/max reduction has no cross-texel support, so
+        // the partial rect only needs even alignment in depth coords — each
+        // output texel depends on exactly its own 2x2 quad.
         GlStateManager._bindTexture(depthTex);
         GL20.glUniform1i(uSrcIsDepth, 1);
         GL20.glUniform1i(uSrcLod, 0);
@@ -165,13 +191,20 @@ public final class SpotShadowPyramid
             int pixX = SpotlightDepthAtlas.tilePixelX(tile);
             int pixY = SpotlightDepthAtlas.tilePixelY(tile);
             int sz = SpotlightDepthAtlas.tileSizePx(tile);
-            GL20.glUniform2i(uSrcOrigin, pixX, pixY);
-            dispatchTile(pixX >> 1, pixY >> 1, sz >> 1);
+            long r = flushRect[tile];
+            int rx0 = r == ShadowRect.FULL ? 0 : ShadowRect.x0(r) & ~1;
+            int ry0 = r == ShadowRect.FULL ? 0 : ShadowRect.y0(r) & ~1;
+            int rx1 = r == ShadowRect.FULL ? sz : Math.min(sz, (ShadowRect.x1(r) + 1) & ~1);
+            int ry1 = r == ShadowRect.FULL ? sz : Math.min(sz, (ShadowRect.y1(r) + 1) & ~1);
+            GL20.glUniform2i(uSrcOrigin, pixX + rx0, pixY + ry0);
+            dispatchRect((pixX >> 1) + (rx0 >> 1), (pixY >> 1) + (ry0 >> 1), (rx1 - rx0) >> 1, (ry1 - ry0) >> 1);
         }
         GL42.glMemoryBarrier(GL42.GL_TEXTURE_FETCH_BARRIER_BIT);
 
         // passes 1..levels-1: lod L-1 -> lod L for all dirty tiles, one barrier per LEVEL
-        // (texelFetch with explicit lod; no feedback loop: image write and sampled level differ)
+        // (texelFetch with explicit lod; no feedback loop: image write and sampled level differ).
+        // The rect shrinks with the chain: floor/ceil halving covers exactly the
+        // outputs whose 2x2 source quad overlaps the previous level's write rect.
         GlStateManager._bindTexture(texId);
         GL20.glUniform1i(uSrcIsDepth, 0);
         for (int lod = 1; lod < levels; lod++)
@@ -186,8 +219,8 @@ public final class SpotShadowPyramid
                 }
                 int pixX = SpotlightDepthAtlas.tilePixelX(tile);
                 int pixY = SpotlightDepthAtlas.tilePixelY(tile);
-                int dstW = SpotlightDepthAtlas.tileSizePx(tile) >> (lod + 1);
-                if (dstW == 0)
+                int regionW = SpotlightDepthAtlas.tileSizePx(tile) >> (lod + 1);
+                if (regionW == 0)
                 {
                     // A sub-tile's chain ends at one texel per sub-tile — a
                     // deeper lod would mix neighbouring tiles. Full-size tiles
@@ -195,8 +228,14 @@ public final class SpotShadowPyramid
                     // log2(tileSize) already bottoms them out at one texel.
                     continue;
                 }
-                GL20.glUniform2i(uSrcOrigin, pixX >> lod, pixY >> lod);
-                dispatchTile(pixX >> (lod + 1), pixY >> (lod + 1), dstW);
+                long r = flushRect[tile];
+                int step = 1 << (lod + 1);
+                int ox0 = r == ShadowRect.FULL ? 0 : Math.min(regionW - 1, ShadowRect.x0(r) / step);
+                int oy0 = r == ShadowRect.FULL ? 0 : Math.min(regionW - 1, ShadowRect.y0(r) / step);
+                int ox1 = r == ShadowRect.FULL ? regionW : Math.min(regionW, (ShadowRect.x1(r) + step - 1) / step);
+                int oy1 = r == ShadowRect.FULL ? regionW : Math.min(regionW, (ShadowRect.y1(r) + step - 1) / step);
+                GL20.glUniform2i(uSrcOrigin, (pixX >> lod) + (ox0 << 1), (pixY >> lod) + (oy0 << 1));
+                dispatchRect((pixX >> (lod + 1)) + ox0, (pixY >> (lod + 1)) + oy0, ox1 - ox0, oy1 - oy0);
             }
             // next level's texelFetches (and finally the deferred pass) read what this level stored
             GL42.glMemoryBarrier(GL42.GL_TEXTURE_FETCH_BARRIER_BIT);
@@ -220,12 +259,11 @@ public final class SpotShadowPyramid
         GL42.glBindImageTexture(0, texId, dstLod, false, 0, GL15.GL_WRITE_ONLY, GL30.GL_RG32F);
     }
 
-    private static void dispatchTile(int dstOrigX, int dstOrigY, int dstW)
+    private static void dispatchRect(int dstOrigX, int dstOrigY, int dstW, int dstH)
     {
         GL20.glUniform2i(uDstOrigin, dstOrigX, dstOrigY);
-        GL20.glUniform2i(uDstSize, dstW, dstW);
-        int groups = (dstW + 7) / 8;
-        GL43.glDispatchCompute(groups, groups, 1);
+        GL20.glUniform2i(uDstSize, dstW, dstH);
+        GL43.glDispatchCompute((dstW + 7) / 8, (dstH + 7) / 8, 1);
     }
 
     private static void ensureResources()

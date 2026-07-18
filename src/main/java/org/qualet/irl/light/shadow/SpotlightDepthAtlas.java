@@ -175,6 +175,15 @@ public final class SpotlightDepthAtlas
         INSTANCE.copyStaticToLive(tile);
     }
 
+    /** Rect variant of {@link #copyStaticToLive}: restore only a TILE-LOCAL
+     *  depth-pixel sub-rect of the static base (partial-tile overlay — the
+     *  region the dynamic casters touched this frame or last). The rect must
+     *  lie inside the tile; the caller clamps. */
+    public static void copyStaticToLiveRect(int tile, int localX, int localY, int w, int h)
+    {
+        INSTANCE.copyStaticToLiveRect(INSTANCE.tilePixelX(tile) + localX, INSTANCE.tilePixelY(tile) + localY, w, h);
+    }
+
     public static void delete()
     {
         SpotShadowPyramid.delete(); // pyramid base size tracks the atlas size

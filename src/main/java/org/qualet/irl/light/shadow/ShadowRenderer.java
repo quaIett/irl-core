@@ -181,6 +181,24 @@ public final class ShadowRenderer
     }
 
     /**
+     * Narrow the current pass's scissor to a TILE-LOCAL depth-pixel rect
+     * (partial-tile overlay draw: only the dynamic casters' region may be
+     * written — the scissor is the HARD bound that keeps depth writes inside
+     * the region the filters will re-run on, so an under-estimated caster
+     * bbox degrades to visible silhouette clipping, never to stale
+     * pyramid/EVSM content being sampled as fresh). Call between
+     * {@link #beginSpot} (which set the full-tile scissor; the viewport — the
+     * NDC mapping — stays full-tile) and the caster draws; {@link #endPass}
+     * restores the caller's scissor as usual.
+     */
+    public static void restrictScissorSpot(int tile, int localX, int localY, int w, int h)
+    {
+        int px = SpotlightDepthAtlas.tilePixelX(tile);
+        int py = SpotlightDepthAtlas.tilePixelY(tile);
+        GL11.glScissor(px + localX, py + localY, w, h);
+    }
+
+    /**
      * Begin a point-cube face depth pass into the live or static atlas (see
      * {@link #beginSpot} for the {@code toStatic}/{@code clear} semantics; the
      * static base of a whole block is restored by

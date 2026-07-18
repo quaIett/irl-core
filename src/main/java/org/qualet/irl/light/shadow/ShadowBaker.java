@@ -9,6 +9,8 @@ import net.minecraft.client.world.ClientWorld;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
+import org.joml.Matrix4f;
+import org.joml.Vector4f;
 import org.qualet.irl.light.LightRegistry;
 
 import java.util.Arrays;
@@ -119,6 +121,26 @@ public final class ShadowBaker
      *  rather than blitting all 6. Absent key reads 0 (FastUtil default). Same
      *  lifecycle as lastSig (purge / retain / reset). */
     private static final Long2IntOpenHashMap lastFaceDynamic = new Long2IntOpenHashMap();
+
+    /** Per-light TILE-LOCAL depth-pixel rect ({@link ShadowRect} packing) the
+     *  SPOT overlay's dynamic casters were drawn into on the LAST overlay
+     *  frame — the spot twin of {@link #lastFaceDynamic}: the per-frame
+     *  static->live restore must cover last frame's silhouettes as well as
+     *  this frame's, so the copy (and the filter rebuild) runs on the union.
+     *  {@link ShadowRect#FULL} = the whole tile was written (an estimate
+     *  bailed, or the no-static clear path ran). Absent key = treated FULL.
+     *  Same lifecycle as lastSig (purge / retain / reset); any tile
+     *  change/re-bake mid-overlay forces the full-tile path (BAKE_FORCED), so
+     *  a stored rect never outlives the tile it was measured in. */
+    private static final Long2LongOpenHashMap lastDynRect = new Long2LongOpenHashMap();
+
+    /** Kill switch for the partial-tile spot overlay (copy/scissor/filter
+     *  rects): -Dirlite.noPartialFilter=true restores the full-tile paths. */
+    private static final boolean NO_PARTIAL = Boolean.getBoolean("irlite.noPartialFilter");
+
+    /** Scratch for {@link #computeSpotDynRect} (render thread only). */
+    private static final Matrix4f dynRectMatrix = new Matrix4f();
+    private static final Vector4f dynRectVec = new Vector4f();
 
     /** Set true by {@link #scanInRange} when any in-range occluder is an entity
      *  or film replay (a dynamic subject) -> the light re-bakes every frame. */
@@ -633,6 +655,12 @@ public final class ShadowBaker
                 ShadowRenderer.endPass();
                 SpotShadowPyramid.markDirty(myTile);
                 SpotShadowEvsm.markDirty(myTile, range);
+                // Full-tile unscissored draws: a stored partial rect from an
+                // earlier cached-overlay episode understates what this frame
+                // wrote — forget it, or a cache OFF->ON flip mid-overlay would
+                // partial-restore around a stale rect and keep frozen ghost
+                // silhouettes outside it (same rule as the no-static branch).
+                lastDynRect.remove(id);
                 rememberLive(id, sig, myTile, blocks, dyn);
                 releaseOldTile(spotTileOwner, id, prevTile, myTile); // bake succeeded into myTile -> free the old tier's tile
                 continue;
@@ -732,6 +760,10 @@ public final class ShadowBaker
             // changes; every frame it is GPU-copied into the live tile and only
             // the dynamic casters are re-rendered on top — the per-frame cost
             // no longer scales with the static scenery around the lamp.
+            // Rect the filters must rebuild this frame; FULL outside the
+            // partial-tile overlay path (bakedStatic frames, no-static clears,
+            // bailed estimates, the kill switch).
+            long filterRect = ShadowRect.FULL;
             if (hasStatic)
             {
                 boolean staticStale = !lastStaticTile.containsKey(id)
@@ -748,11 +780,13 @@ public final class ShadowBaker
                 boolean staticMustBake = !dyn
                     || !lastStaticTile.containsKey(id)
                     || lastStaticTile.get(id) != myTile;
+                boolean bakedStatic = false;
                 // A must-bake here is FORCED (the copy below has no valid base to
                 // fall back on, or the leave transition can't carry over) — never
                 // throttled; the deferrable case still honours the frame budget.
                 if (staticStale && allowStaticBake(staticMustBake ? BAKE_FORCED : BAKE_DEFERRABLE))
                 {
+                    bakedStatic = true;
                     if (PROFILE)
                     {
                         profSpotBakes++;
@@ -776,7 +810,38 @@ public final class ShadowBaker
                     // bake is the one guaranteed spot to complete the handoff.
                     releaseOldTile(spotTileOwner, id, prevTile, myTile);
                 }
-                SpotlightDepthAtlas.copyStaticToLive(myTile);
+
+                // Partial-tile overlay: everything that changes on a steady
+                // overlay frame lies inside the dynamic casters' projected
+                // bbox — restore/refilter only union(this frame's rect, last
+                // frame's rect: a vacated region must return to the static
+                // base, the lastFaceDynamic pattern). A fresh static bake
+                // invalidates the whole tile's filtered content -> FULL.
+                int ts = SpotlightDepthAtlas.tileSizePx(myTile);
+                long dynRect = ShadowRect.FULL;
+                if (!NO_PARTIAL && dyn && !bakedStatic)
+                {
+                    dynRect = computeSpotDynRect(lx, ly, lz, lxD, lyD, lzD,
+                        ndx, ndy, ndz, cone, range, outerDeg, ts);
+                }
+                long copyRect = bakedStatic ? ShadowRect.FULL
+                    : ShadowRect.union(dynRect, lastDynRect.containsKey(id) ? lastDynRect.get(id) : ShadowRect.FULL);
+                if (copyRect != ShadowRect.FULL && ShadowRect.coversMost(copyRect, ts, 7, 10))
+                {
+                    copyRect = ShadowRect.FULL;
+                }
+                if (copyRect == ShadowRect.FULL)
+                {
+                    SpotlightDepthAtlas.copyStaticToLive(myTile);
+                }
+                else
+                {
+                    SpotlightDepthAtlas.copyStaticToLiveRect(myTile,
+                        ShadowRect.x0(copyRect), ShadowRect.y0(copyRect),
+                        ShadowRect.x1(copyRect) - ShadowRect.x0(copyRect),
+                        ShadowRect.y1(copyRect) - ShadowRect.y0(copyRect));
+                    probeCount("sp.rect", 1);
+                }
                 probeCount("sp.copy", 1);
                 if (dyn)
                 {
@@ -786,9 +851,27 @@ public final class ShadowBaker
                     }
                     probeCount("sp.dyn", 1);
                     ShadowRenderer.beginSpot(myTile, lxD, lyD, lzD, dx, dy, dz, range, outerDeg, false, false);
+                    if (dynRect != ShadowRect.FULL)
+                    {
+                        // HARD bound: depth writes may not escape the rect the
+                        // filters rebuild (an under-estimate clips visibly
+                        // instead of desyncing the pyramid/EVSM).
+                        ShadowRenderer.restrictScissorSpot(myTile,
+                            ShadowRect.x0(dynRect), ShadowRect.y0(dynRect),
+                            ShadowRect.x1(dynRect) - ShadowRect.x0(dynRect),
+                            ShadowRect.y1(dynRect) - ShadowRect.y0(dynRect));
+                    }
                     renderInRangeCone(CASTERS_DYNAMIC, tickDelta);
                     ShadowRenderer.endPass();
+                    lastDynRect.put(id, dynRect);
                 }
+                else
+                {
+                    // Leave frame: the (forced) full copy just restored pure
+                    // static content — nothing dynamic left to track.
+                    lastDynRect.remove(id);
+                }
+                filterRect = copyRect;
             }
             else
             {
@@ -808,13 +891,26 @@ public final class ShadowBaker
                     renderInRangeCone(CASTERS_DYNAMIC, tickDelta);
                 }
                 ShadowRenderer.endPass();
+                // Full-tile clear + unscissored draws: any stored rect
+                // understates what this path wrote — forget it, so a later
+                // hasStatic episode starts from a FULL restore.
+                lastDynRect.remove(id);
                 // The live tile was fully rewritten (clear + dynamics), i.e. a
                 // successful bake into myTile -> same release rule as above.
                 releaseOldTile(spotTileOwner, id, prevTile, myTile);
             }
-            // overlay mode rewrites the live tile every frame (copy + dynamics) -> pyramid + EVSM follow every frame
-            SpotShadowPyramid.markDirty(myTile);
-            SpotShadowEvsm.markDirty(myTile, range);
+            // overlay mode rewrites live content every frame -> pyramid + EVSM
+            // follow every frame, on the same rect the copy/draws touched
+            if (filterRect == ShadowRect.FULL)
+            {
+                SpotShadowPyramid.markDirty(myTile);
+                SpotShadowEvsm.markDirty(myTile, range);
+            }
+            else
+            {
+                SpotShadowPyramid.markDirtyRect(myTile, filterRect);
+                SpotShadowEvsm.markDirtyRect(myTile, filterRect, range);
+            }
 
             if (dyn)
             {
@@ -1579,6 +1675,7 @@ public final class ShadowBaker
         lastStaticTile.remove(id);
         lastStaticBlocks.remove(id);
         lastFaceDynamic.remove(id);
+        lastDynRect.remove(id);
         wasDynamic.remove(id);
         contentionHold.remove(id);
     }
@@ -1597,6 +1694,7 @@ public final class ShadowBaker
         lastStaticTile.clear();
         lastStaticBlocks.clear();
         lastFaceDynamic.clear();
+        lastDynRect.clear();
         wasDynamic.clear();
         contentionHold.clear();
     }
@@ -1708,6 +1806,10 @@ public final class ShadowBaker
         if (!lastFaceDynamic.isEmpty())
         {
             lastFaceDynamic.keySet().retainAll(keep);
+        }
+        if (!lastDynRect.isEmpty())
+        {
+            lastDynRect.keySet().retainAll(keep);
         }
         if (!wasDynamic.isEmpty())
         {
@@ -1897,6 +1999,101 @@ public final class ShadowBaker
             ShadowRenderer.emitCaster(ShadowEngine.source(), occ[k], occType[k], tickDelta);
         }
         ShadowRenderer.endCasterBatch();
+    }
+
+    /**
+     * NDC-project the dynamic shortlist casters' AABBs into the spot's tile
+     * and return the union as a TILE-LOCAL depth-pixel rect ({@link ShadowRect}
+     * packing), or {@link ShadowRect#FULL} when the partial path can't be
+     * trusted this frame: degenerate direction, a caster corner at/behind the
+     * near plane (a sphere containing the light projects unbounded), an empty
+     * dynamic set (defensive — scan==render says it can't happen when dyn), or
+     * a union covering most of the tile anyway. Mirrors
+     * {@link ShadowRenderer#beginSpot}'s matrices exactly: anchor A =
+     * round((float) light), eye = L - A, same up rule, NEAR 0.05, aspect 1 —
+     * a convex box in front of the near plane projects inside the convex hull
+     * of its 8 projected corners, so the AABB (which contains the caster's
+     * cull sphere, which contains the drawn silhouette per seam INVARIANT 5)
+     * bounds the depth writes conservatively. The scissor set from this rect
+     * is the HARD bound for those writes, so an under-estimate degrades to
+     * visible silhouette clipping, never to the filters missing fresh depth.
+     */
+    private static long computeSpotDynRect(float lx, float ly, float lz,
+                                           double lxD, double lyD, double lzD,
+                                           float ndx, float ndy, float ndz, boolean validDir,
+                                           float range, float outerDeg, int ts)
+    {
+        if (!validDir)
+        {
+            return ShadowRect.FULL;
+        }
+        // Beyond 2^23 blocks a float coordinate's ulp reaches 1.0: the SoA
+        // centers (cast to float at collect) can drift up to ~0.5 block off
+        // the double-anchored positions the casters actually draw at, eroding
+        // the sphere's slack — fall back to the full tile out there rather
+        // than risk the hard scissor clipping a silhouette edge.
+        if (Math.abs(lx) > 8_388_608f || Math.abs(ly) > 8_388_608f || Math.abs(lz) > 8_388_608f)
+        {
+            return ShadowRect.FULL;
+        }
+        int axi = Math.round(lx), ayi = Math.round(ly), azi = Math.round(lz);
+        float ex = (float) (lxD - axi), ey = (float) (lyD - ayi), ez = (float) (lzD - azi);
+        float fovDeg = Math.max(outerDeg, 1.0f);
+        float far = Math.max(range, 0.05f + 0.1f);
+        boolean zUp = Math.abs(ndy) > 0.99f; // ShadowRenderer.pickStableUp
+        dynRectMatrix.identity()
+            .perspective((float) Math.toRadians(fovDeg), 1.0f, 0.05f, far)
+            .lookAt(ex, ey, ez, ex + ndx, ey + ndy, ez + ndz,
+                    0f, zUp ? 0f : 1f, zUp ? 1f : 0f);
+
+        float minU = Float.POSITIVE_INFINITY, minV = Float.POSITIVE_INFINITY;
+        float maxU = Float.NEGATIVE_INFINITY, maxV = Float.NEGATIVE_INFINITY;
+        boolean any = false;
+        for (int s = 0; s < shortCount; s++)
+        {
+            int k = shortIdx[s];
+            if (oStatic[k])
+            {
+                continue;
+            }
+            any = true;
+            float cx = ox[k] - axi, cy = oy[k] - ayi, cz = oz[k] - azi;
+            float rad = orad[k];
+            for (int corner = 0; corner < 8; corner++)
+            {
+                dynRectVec.set(
+                    cx + (((corner & 1) == 0) ? -rad : rad),
+                    cy + (((corner & 2) == 0) ? -rad : rad),
+                    cz + (((corner & 4) == 0) ? -rad : rad),
+                    1f);
+                dynRectMatrix.transform(dynRectVec);
+                if (dynRectVec.w < 0.05f)
+                {
+                    return ShadowRect.FULL; // corner at/behind the near plane
+                }
+                float u = (dynRectVec.x / dynRectVec.w * 0.5f + 0.5f) * ts;
+                float v = (dynRectVec.y / dynRectVec.w * 0.5f + 0.5f) * ts;
+                minU = Math.min(minU, u);
+                minV = Math.min(minV, v);
+                maxU = Math.max(maxU, u);
+                maxV = Math.max(maxV, v);
+            }
+        }
+        if (!any)
+        {
+            return ShadowRect.FULL;
+        }
+        // +1 px slack against rasterization rounding; clamp into the tile.
+        int x0 = Math.max(0, (int) Math.floor(minU) - 1);
+        int y0 = Math.max(0, (int) Math.floor(minV) - 1);
+        int x1 = Math.min(ts, (int) Math.ceil(maxU) + 1);
+        int y1 = Math.min(ts, (int) Math.ceil(maxV) + 1);
+        if (x1 <= x0 || y1 <= y0)
+        {
+            return ShadowRect.FULL; // fully off-tile after clamp — shouldn't happen for cone-culled casters
+        }
+        long rect = ShadowRect.pack(x0, y0, x1, y1);
+        return ShadowRect.coversMost(rect, ts, 7, 10) ? ShadowRect.FULL : rect;
     }
 
     /** Small angular slack (radians) added to the spot cone test so a subject
