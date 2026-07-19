@@ -150,6 +150,11 @@ public final class SpotShadowPyramid
         {
             probe.counter("pyr.sp", Long.bitCount(mask));
         }
+        // Dispatch-area telemetry (probe-gated emission): pxact = total texels
+        // dispatched across the chain, pxl0 = the lod-0 share. The min/max chain
+        // has no aprons — deep-lod overhead is bounded by the 4/3 series, so
+        // pxact/pxl0 near 1.33 means "nothing to shave here".
+        long pxAct = 0, pxL0 = 0;
 
         // --- save the state we touch (current program, one 2D texture binding, image unit 0): once per batch ---
         int prevProgram = GL11.glGetInteger(GL20.GL_CURRENT_PROGRAM);
@@ -197,6 +202,9 @@ public final class SpotShadowPyramid
             int rx1 = r == ShadowRect.FULL ? sz : Math.min(sz, (ShadowRect.x1(r) + 1) & ~1);
             int ry1 = r == ShadowRect.FULL ? sz : Math.min(sz, (ShadowRect.y1(r) + 1) & ~1);
             GL20.glUniform2i(uSrcOrigin, pixX + rx0, pixY + ry0);
+            long a0 = (long) ((rx1 - rx0) >> 1) * ((ry1 - ry0) >> 1);
+            pxL0 += a0;
+            pxAct += a0;
             dispatchRect((pixX >> 1) + (rx0 >> 1), (pixY >> 1) + (ry0 >> 1), (rx1 - rx0) >> 1, (ry1 - ry0) >> 1);
         }
         GL42.glMemoryBarrier(GL42.GL_TEXTURE_FETCH_BARRIER_BIT);
@@ -235,10 +243,16 @@ public final class SpotShadowPyramid
                 int ox1 = r == ShadowRect.FULL ? regionW : Math.min(regionW, (ShadowRect.x1(r) + step - 1) / step);
                 int oy1 = r == ShadowRect.FULL ? regionW : Math.min(regionW, (ShadowRect.y1(r) + step - 1) / step);
                 GL20.glUniform2i(uSrcOrigin, (pixX >> lod) + (ox0 << 1), (pixY >> lod) + (oy0 << 1));
+                pxAct += (long) (ox1 - ox0) * (oy1 - oy0);
                 dispatchRect((pixX >> (lod + 1)) + ox0, (pixY >> (lod + 1)) + oy0, ox1 - ox0, oy1 - oy0);
             }
             // next level's texelFetches (and finally the deferred pass) read what this level stored
             GL42.glMemoryBarrier(GL42.GL_TEXTURE_FETCH_BARRIER_BIT);
+        }
+        if (probe != null)
+        {
+            probe.counter("pyr.pxact", (int) pxAct);
+            probe.counter("pyr.pxl0", (int) pxL0);
         }
 
         // --- restore ---

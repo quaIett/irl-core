@@ -212,6 +212,13 @@ public final class SpotShadowEvsm
         {
             probe.counter("evsm.sp", Long.bitCount(mask));
         }
+        // Apron/deep-lod cost attribution (probe-gated emission; the adds are
+        // noise). All in region-local texels, x3 = the three passes per lod:
+        //   pxact  = dispatched footprint (reduce S + H S + V W),
+        //   pxcore = 3*C per lod (zero-width aprons THIS lod, propagation kept),
+        //   pxideal= 3*I per lod (C_L0 halved with no growth at all).
+        // apron share = (act-core)/act, propagation share = (core-ideal)/act.
+        long pxAct = 0, pxCore = 0, pxIdeal = 0;
 
         int prevProgram = GL11.glGetInteger(GL20.GL_CURRENT_PROGRAM);
         int prevTex = GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D);
@@ -274,6 +281,7 @@ public final class SpotShadowEvsm
                 cx1 = Math.min(region0, (ShadowRect.x1(r) + step - 1) / step);
                 cy1 = Math.min(region0, (ShadowRect.y1(r) + step - 1) / step);
             }
+            int ix0 = cx0, iy0 = cy0, ix1 = cx1, iy1 = cy1; // ideal (growth-free) chain
 
             for (int lod = 0; lod < levels; lod++)
             {
@@ -290,6 +298,10 @@ public final class SpotShadowEvsm
                 int sW = sx1 - sx0, sH = sy1 - sy0;
                 int wW = wx1 - wx0, wH = wy1 - wy0;
                 int regOrigX = pixX >> (lod + shift), regOrigY = pixY >> (lod + shift);
+
+                pxAct += (long) sW * sH * 2L + (long) wW * wH;
+                pxCore += (long) (cx1 - cx0) * (cy1 - cy0) * 3L;
+                pxIdeal += (long) (ix1 - ix0) * (iy1 - iy0) * 3L;
 
                 // reduce -> scratch (raw moments, scratch-local at (0,0))
                 if (lod == 0)
@@ -349,7 +361,17 @@ public final class SpotShadowEvsm
                 cy0 = wy0 >> 1;
                 cx1 = (wx1 + 1) >> 1;
                 cy1 = (wy1 + 1) >> 1;
+                ix0 = ix0 >> 1;
+                iy0 = iy0 >> 1;
+                ix1 = (ix1 + 1) >> 1;
+                iy1 = (iy1 + 1) >> 1;
             }
+        }
+        if (probe != null)
+        {
+            probe.counter("evsm.pxact", (int) pxAct);
+            probe.counter("evsm.pxcore", (int) pxCore);
+            probe.counter("evsm.pxideal", (int) pxIdeal);
         }
 
         GlStateManager._bindTexture(prevTex);
