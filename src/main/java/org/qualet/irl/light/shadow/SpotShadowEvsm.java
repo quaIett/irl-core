@@ -438,6 +438,10 @@ public final class SpotShadowEvsm
         GlStateManager._bindTexture(texId);
         GL42.glTexStorage2D(GL11.GL_TEXTURE_2D, levels, GL30.GL_RGBA32F,
             SpotlightDepthAtlas.getAtlasWidth() >> shift, SpotlightDepthAtlas.getAtlasHeight() >> shift);
+        ShadowAllocLog.log("spot-evsm " + (SpotlightDepthAtlas.getAtlasWidth() >> shift) + "x"
+                + (SpotlightDepthAtlas.getAtlasHeight() >> shift) + " rgba32f",
+            ShadowAllocLog.mipChainBytes(SpotlightDepthAtlas.getAtlasWidth() >> shift,
+                SpotlightDepthAtlas.getAtlasHeight() >> shift, levels, 16L));
         // trilinear: the shader picks a fractional lod from the penumbra width
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_LINEAR_MIPMAP_LINEAR);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_LINEAR);
@@ -462,6 +466,7 @@ public final class SpotShadowEvsm
         int id = GlStateManager._genTexture();
         GlStateManager._bindTexture(id);
         GL42.glTexStorage2D(GL11.GL_TEXTURE_2D, 1, GL30.GL_RGBA32F, side, side);
+        ShadowAllocLog.log("spot-evsm scratch " + side + "^2 rgba32f", (long) side * side * 16L);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL12.GL_TEXTURE_BASE_LEVEL, 0);

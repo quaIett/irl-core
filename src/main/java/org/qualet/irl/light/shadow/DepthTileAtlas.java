@@ -265,6 +265,8 @@ final class DepthTileAtlas
         this.glTextureId = ids[0];
         this.glFboId = ids[1];
         this.initialized = true;
+        ShadowAllocLog.log(this.debugName + " live depth " + this.getAtlasWidth() + "x" + this.getAtlasHeight(),
+            (long) this.getAtlasWidth() * this.getAtlasHeight() * 4L);
     }
 
     private void initStatic()
@@ -273,6 +275,8 @@ final class DepthTileAtlas
         this.staticTextureId = ids[0];
         this.staticFboId = ids[1];
         this.staticInitialized = true;
+        ShadowAllocLog.log(this.debugName + " static depth " + this.getAtlasWidth() + "x" + this.getAtlasHeight(),
+            (long) this.getAtlasWidth() * this.getAtlasHeight() * 4L);
     }
 
     /** Allocate one depth atlas texture + FBO, cleared to far plane. Returns

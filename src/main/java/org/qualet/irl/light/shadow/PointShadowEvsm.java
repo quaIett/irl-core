@@ -433,6 +433,8 @@ public final class PointShadowEvsm
             texId[t] = GL11.glGenTextures();
             GL11.glBindTexture(GL30.GL_TEXTURE_2D_ARRAY, texId[t]);
             GL43.glTexStorage3D(GL30.GL_TEXTURE_2D_ARRAY, levels[t], GL30.GL_RGBA32F, base, base, PointDepthAtlas.tierBlockCount(t) * 6);
+            ShadowAllocLog.log("point-evsm t" + t + " " + base + "^2 x" + (PointDepthAtlas.tierBlockCount(t) * 6) + " rgba32f",
+                ShadowAllocLog.mipChainBytes(base, levels[t], 16L) * PointDepthAtlas.tierBlockCount(t) * 6L);
             GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_LINEAR_MIPMAP_LINEAR);
             GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_LINEAR);
             GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_WRAP_S, GL12.GL_CLAMP_TO_EDGE);
@@ -445,6 +447,8 @@ public final class PointShadowEvsm
         GL11.glBindTexture(GL30.GL_TEXTURE_2D_ARRAY, tempId);
         GL43.glTexStorage3D(GL30.GL_TEXTURE_2D_ARRAY, 1, GL30.GL_RGBA32F,
             PointDepthAtlas.getTileSize() / 2, PointDepthAtlas.getTileSize() / 2, 6);
+        ShadowAllocLog.log("point-evsm temp " + (PointDepthAtlas.getTileSize() / 2) + "^2 x6 rgba32f",
+            (long) (PointDepthAtlas.getTileSize() / 2) * (PointDepthAtlas.getTileSize() / 2) * 6L * 16L);
         GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);
         GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST);
         GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL12.GL_TEXTURE_BASE_LEVEL, 0);

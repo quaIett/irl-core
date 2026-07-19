@@ -49,6 +49,9 @@ public enum IRLShadowQuality
         current = this;
         PointDepthAtlas.setTileSize(this.pointFaceSize);
         SpotlightDepthAtlas.setTileSize(this.spotTileSize);
+        System.out.println("[irl-core] quality: " + this.name()
+            + " (point F=" + this.pointFaceSize + " -> effective " + PointDepthAtlas.getTileSize()
+            + ", spot tile=" + this.spotTileSize + " -> effective " + SpotlightDepthAtlas.getTileSize() + ")");
         // ULTRA runs the spot EVSM chain at atlas/4 instead of atlas/2: the
         // filter re-runs per overlay tile per frame, and at 4096 tiles the
         // full-base chain alone (~30 ms for a 25-lamp scene) capped the frame

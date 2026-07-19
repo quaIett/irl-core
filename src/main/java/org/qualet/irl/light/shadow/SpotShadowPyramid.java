@@ -308,6 +308,10 @@ public final class SpotShadowPyramid
         levels = Integer.numberOfTrailingZeros(Integer.highestOneBit(SpotlightDepthAtlas.getTileSize()));
         GL42.glTexStorage2D(GL11.GL_TEXTURE_2D, levels, GL30.GL_RG32F,
             SpotlightDepthAtlas.getAtlasWidth() / 2, SpotlightDepthAtlas.getAtlasHeight() / 2);
+        ShadowAllocLog.log("spot-pyr " + (SpotlightDepthAtlas.getAtlasWidth() / 2) + "x"
+                + (SpotlightDepthAtlas.getAtlasHeight() / 2) + " rg32f",
+            ShadowAllocLog.mipChainBytes(SpotlightDepthAtlas.getAtlasWidth() / 2,
+                SpotlightDepthAtlas.getAtlasHeight() / 2, levels, 8L));
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_S, GL12.GL_CLAMP_TO_EDGE);

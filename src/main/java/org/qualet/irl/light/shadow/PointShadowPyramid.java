@@ -300,6 +300,8 @@ public final class PointShadowPyramid
             levels[t] = Integer.numberOfTrailingZeros(Integer.highestOneBit(PointDepthAtlas.tierFaceSizePx(t)));
             int base = PointDepthAtlas.tierFaceSizePx(t) / 2;
             GL43.glTexStorage3D(GL30.GL_TEXTURE_2D_ARRAY, levels[t], GL30.GL_RG32F, base, base, PointDepthAtlas.tierBlockCount(t) * 6);
+            ShadowAllocLog.log("point-pyr t" + t + " " + base + "^2 x" + (PointDepthAtlas.tierBlockCount(t) * 6) + " rg32f",
+                ShadowAllocLog.mipChainBytes(base, levels[t], 8L) * PointDepthAtlas.tierBlockCount(t) * 6L);
             GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);
             GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST);
             GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_WRAP_S, GL12.GL_CLAMP_TO_EDGE);
