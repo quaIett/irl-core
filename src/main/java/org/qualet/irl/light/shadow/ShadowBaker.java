@@ -231,6 +231,14 @@ public final class ShadowBaker
     // ranked light fits.
     private static final int[] SPOT_TIER_END;
     private static final int[] POINT_TIER_END;
+    /** Per-frame HANDOUT cap of each point tier (exclusive end in the global
+     *  block space), refreshed every bake from
+     *  {@link ShadowVramBudget#approvedPointBlocks}: physical filter-array
+     *  capacity plus at most one pre-approved growth chunk. Rank->tier
+     *  mapping stays {@link #POINT_TIER_END} (frozen GLSL ABI) — the cap only
+     *  bounds which blocks may be handed OUT, never which tier a rank wants.
+     *  Spot has no equivalent (its filter textures are atlas-sized). */
+    private static final int[] POINT_TIER_CAP = new int[3];
     /** Sentinel "no tier" — compares WORSE (larger) than any real tier index; a
      *  light ranked past the last tier goes unshadowed for the frame. */
     private static final int TIER_NONE = Integer.MAX_VALUE;
@@ -325,6 +333,7 @@ public final class ShadowBaker
         for (int t = 0; t < POINT_TIER_END.length; t++)
         {
             POINT_TIER_END[t] = PointDepthAtlas.tierStartBlock(t) + PointDepthAtlas.tierBlockCount(t);
+            POINT_TIER_CAP[t] = POINT_TIER_END[t]; // pre-first-bake default; refreshed every prologue
         }
     }
 
@@ -434,6 +443,18 @@ public final class ShadowBaker
         {
             resetTileState();
             lastQuality = quality;
+        }
+
+        // Per-frame growth approval for the demand-sized point filter arrays:
+        // the acquire paths below never hand out a point block past the
+        // approved per-tier cap, so the post-loop filter flushes can always
+        // allocate the layers behind every published block. Denied growth
+        // (VRAM reserve would break) just shrinks the effective pool — lamps
+        // past it take the existing spare/unshadowed paths.
+        ShadowVramBudget.updatePointCaps();
+        for (int t = 0; t < POINT_TIER_CAP.length; t++)
+        {
+            POINT_TIER_CAP[t] = PointDepthAtlas.tierStartBlock(t) + ShadowVramBudget.approvedPointBlocks(t);
         }
 
         collect(world, cameraPos, tickDelta);
@@ -612,7 +633,7 @@ public final class ShadowBaker
                 // owned, so the normal path below either re-uses our own valid
                 // map or first-bakes (mandatory-gated, SHADOW_PENDING on
                 // refusal) before anything samples it.
-                myTile = acquireSpareTile(spotTileOwner, spotTileActive, id, SPOT_TIER_END);
+                myTile = acquireSpareTile(spotTileOwner, spotTileActive, id, SPOT_TIER_END, SPOT_TIER_END);
                 if (myTile < 0)
                 {
                     continue; // nothing owned, free or reclaimable: unshadowed (tile -1)
@@ -620,7 +641,7 @@ public final class ShadowBaker
             }
             else
             {
-                myTile = acquireTileTiered(spotTileOwner, spotTileActive, id, desired, SPOT_TIER_END);
+                myTile = acquireTileTiered(spotTileOwner, spotTileActive, id, desired, SPOT_TIER_END, SPOT_TIER_END);
                 if (myTile < 0)
                 {
                     // Every tile of every fallback tier is owned by a recently-
@@ -1067,7 +1088,7 @@ public final class ShadowBaker
                 // SPARE-CAPACITY mode, age-edge stamp — see the spot loop's
                 // TIER_NONE note. The shadow dies only when the slot is
                 // actually taken by an in-pool light, not at the rank edge.
-                myBlock = acquireSpareTile(pointSlotOwner, pointSlotActive, id, POINT_TIER_END);
+                myBlock = acquireSpareTile(pointSlotOwner, pointSlotActive, id, POINT_TIER_END, POINT_TIER_CAP);
                 if (myBlock < 0)
                 {
                     continue; // nothing owned, free or reclaimable: unshadowed (tile -1)
@@ -1075,7 +1096,7 @@ public final class ShadowBaker
             }
             else
             {
-                myBlock = acquireTileTiered(pointSlotOwner, pointSlotActive, id, desired, POINT_TIER_END);
+                myBlock = acquireTileTiered(pointSlotOwner, pointSlotActive, id, desired, POINT_TIER_END, POINT_TIER_CAP);
                 if (myBlock < 0)
                 {
                     // Every slot of every fallback tier owned by a recently-active
@@ -1426,7 +1447,7 @@ public final class ShadowBaker
      *  tile it owns outside the range is invisible here — the cross-tier
      *  handoff of an owner is the caller's job: release-on-bake-success /
      *  keep-sampling-on-refusal, see the loops). */
-    private static int acquireTile(long[] owner, int[] active, long id, int from, int to)
+    private static int acquireTile(long[] owner, int[] active, long id, int from, int to, int capTo)
     {
         int free = -1;
         int stale = -1;
@@ -1437,6 +1458,14 @@ public final class ShadowBaker
             {
                 active[t] = frameIndex;
                 return t;
+            }
+            if (t >= capTo)
+            {
+                // ownership above is still honored (updatePointCaps floors the
+                // cap at the highest handed-out block, so this only fires in
+                // the window before the first prologue), but nothing new is
+                // handed out past the cap: no filter layers exist there yet
+                continue;
             }
             if (owner[t] == NO_OWNER)
             {
@@ -1464,6 +1493,24 @@ public final class ShadowBaker
         owner[take] = id;
         active[take] = frameIndex;
         return take;
+    }
+
+    /** Highest handed-out block of point tier {@code t}, as a 1-based count
+     *  from the tier start (0 = none owned). The budget's growth floor:
+     *  handed-out blocks get backed by the flush regardless of this frame's
+     *  approval, so {@link ShadowVramBudget#updatePointCaps} never lets the
+     *  cap regress below them (render thread, same thread as bake). */
+    static int ownedPointBlocks(int t)
+    {
+        int start = PointDepthAtlas.tierStartBlock(t);
+        for (int b = POINT_TIER_END[t] - 1; b >= start; b--)
+        {
+            if (pointSlotOwner[b] != NO_OWNER)
+            {
+                return b - start + 1;
+            }
+        }
+        return 0;
     }
 
     /** Tier whose range {@code [tierEnd[t-1], tierEnd[t])} contains
@@ -1537,12 +1584,14 @@ public final class ShadowBaker
      *  recently-active light (the caller then keeps its still-owned tile if it
      *  has one, else leaves the light unshadowed like the old single-pool -1).
      *  The flat pool index IS the value
-     *  published to vlParams.w (spot flat tile / point global slot). */
-    private static int acquireTileTiered(long[] owner, int[] active, long id, int desired, int[] tierEnd)
+     *  published to vlParams.w (spot flat tile / point global slot).
+     *  {@code tierCap} bounds what may be handed OUT per tier (point: the
+     *  budget-approved filter capacity; spot passes its tierEnd = no cap). */
+    private static int acquireTileTiered(long[] owner, int[] active, long id, int desired, int[] tierEnd, int[] tierCap)
     {
         for (int t = desired; t < tierEnd.length; t++)
         {
-            int tile = acquireTile(owner, active, id, t == 0 ? 0 : tierEnd[t - 1], tierEnd[t]);
+            int tile = acquireTile(owner, active, id, t == 0 ? 0 : tierEnd[t - 1], tierEnd[t], tierCap[t]);
             if (tile >= 0)
             {
                 return tile;
@@ -1555,7 +1604,9 @@ public final class ShadowBaker
      *  still-owned tile first, else a free slot, else the stalest slot not
      *  touched for {@code STALE_FRAMES + 1}+ frames (a long-dead owner — gone
      *  lights are otherwise only reclaimed by in-pool steals), preferring
-     *  worse tiers (backward scan) so the good tiers stay with real ranks.
+     *  worse tiers (lowest index within the worst tier that has room, so
+     *  demand-sized filter arrays stay compact) — the good tiers stay with
+     *  real ranks.
      *  NEVER steals from a live holder: full-strength stamps are observed at
      *  age <= 1, and a live spare holder re-stamps {@code frameIndex - 1}
      *  every frame so its observed age is exactly {@link #STALE_FRAMES} —
@@ -1568,30 +1619,42 @@ public final class ShadowBaker
      *  past its margin) counts as reclaimable BY DESIGN: a visible past-pool
      *  shadow outranks an invisible cached map, and the returning owner
      *  first-bakes (mandatory-gated) only if actually reclaimed. */
-    private static int acquireSpareTile(long[] owner, int[] active, long id, int[] tierEnd)
+    private static int acquireSpareTile(long[] owner, int[] active, long id, int[] tierEnd, int[] tierCap)
     {
         int last = tierEnd[tierEnd.length - 1];
-        int free = -1;
-        int dead = -1;
-        int deadAge = Integer.MAX_VALUE;
-        for (int t = last - 1; t >= 0; t--)
+        for (int t = 0; t < last; t++)
         {
             if (owner[t] == id)
             {
                 active[t] = frameIndex - 1;
                 return t;
             }
-            if (owner[t] == NO_OWNER)
+        }
+        // Worse tiers first (so the good tiers stay with real ranks), but
+        // LOWEST index within a tier — compact ownership keeps the
+        // demand-sized filter arrays small (a spare grab at the top of tier 2
+        // would otherwise force the whole tier's layers to allocate).
+        int free = -1;
+        int dead = -1;
+        int deadAge = Integer.MAX_VALUE;
+        for (int tier = tierEnd.length - 1; tier >= 0; tier--)
+        {
+            int from = tier == 0 ? 0 : tierEnd[tier - 1];
+            int to = Math.min(tierEnd[tier], tierCap[tier]);
+            for (int t = from; t < to; t++)
             {
-                if (free < 0)
+                if (owner[t] == NO_OWNER)
                 {
-                    free = t;
+                    if (free < 0)
+                    {
+                        free = t;
+                    }
                 }
-            }
-            else if (frameIndex - active[t] > STALE_FRAMES && active[t] < deadAge)
-            {
-                dead = t;
-                deadAge = active[t];
+                else if (frameIndex - active[t] > STALE_FRAMES && active[t] < deadAge)
+                {
+                    dead = t;
+                    deadAge = active[t];
+                }
             }
         }
         int take = free >= 0 ? free : dead;

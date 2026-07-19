@@ -321,6 +321,18 @@ public final class SpotShadowPyramid
         GlStateManager._bindTexture(prevTex);
     }
 
+    /** Bytes of the currently resident pyramid — feeds the preset-flip
+     *  budget's "about to be freed" accounting. */
+    static long allocatedBytes()
+    {
+        if (texId == 0)
+        {
+            return 0;
+        }
+        return ShadowAllocLog.mipChainBytes(SpotlightDepthAtlas.getAtlasWidth() / 2,
+            SpotlightDepthAtlas.getAtlasHeight() / 2, levels, 8L);
+    }
+
     private static int buildProgram()
     {
         int shader = GL20.glCreateShader(GL43.GL_COMPUTE_SHADER);

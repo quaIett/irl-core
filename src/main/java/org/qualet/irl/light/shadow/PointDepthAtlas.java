@@ -205,9 +205,14 @@ public final class PointDepthAtlas
     /** Switch the tier-0 face extent; frees + re-inits both atlases on next
      *  access. The filter cascade in {@link #delete()} is mandatory —
      *  pyramid/EVSM level counts and temp storage derive from the tile size.
-     *  The requested size is clamped down (power-of-two steps) so the 6T
-     *  atlas fits GL_MAX_TEXTURE_SIZE — the ULTRA preset's 6*4096 = 24576
-     *  exceeds the common 16384 limit and lands on 2048 there. */
+     *  The requested size is clamped down (power-of-two steps) twice: so the
+     *  6T atlas fits GL_MAX_TEXTURE_SIZE (a 16384-limit card lands ULTRA on
+     *  2048; a 32768-limit card passes untouched), and so the chain's
+     *  unavoidable VRAM footprint (both depth layers + tier-0 filters + blur
+     *  temp — see {@link ShadowVramBudget#pointMinFootprintBytes}) fits the
+     *  chain's budget — without this, ULTRA on a 32768-limit 12 GiB card
+     *  allocated 9.6 GiB at world join and thrashed residency for the whole
+     *  session. */
     public static void setTileSize(int newSize)
     {
         int maxTex = GL11.glGetInteger(GL11.GL_MAX_TEXTURE_SIZE);
@@ -221,6 +226,23 @@ public final class PointDepthAtlas
             System.err.println("[irl-core] PointDepthAtlas: face size " + newSize
                 + " needs a " + (newSize * GRID_X * 3) + "px atlas > GL_MAX_TEXTURE_SIZE "
                 + maxTex + "; clamped to " + size);
+        }
+        long resident = INSTANCE.allocatedBytes()
+            + PointShadowPyramid.allocatedBytes() + PointShadowEvsm.allocatedBytes();
+        long budget = ShadowVramBudget.chainBudgetBytes(resident);
+        long cap = budget >= 0 ? budget : ShadowVramBudget.FALLBACK_CHAIN_BYTES;
+        int preBudget = size;
+        while (size > 256 && ShadowVramBudget.pointMinFootprintBytes(size) > cap)
+        {
+            size >>= 1;
+        }
+        if (size != preBudget)
+        {
+            System.out.println("[irl-core] PointDepthAtlas: face size " + preBudget
+                + " needs " + (ShadowVramBudget.pointMinFootprintBytes(preBudget) >> 20)
+                + " MiB > chain budget " + (cap >> 20) + " MiB"
+                + (budget < 0 ? " (free VRAM unqueryable, fallback cap)" : "")
+                + "; clamped to " + size);
         }
         if (size == INSTANCE.getTileSize())
         {

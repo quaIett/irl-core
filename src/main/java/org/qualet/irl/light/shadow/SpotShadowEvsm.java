@@ -498,6 +498,29 @@ public final class SpotShadowEvsm
         return prog;
     }
 
+    /** Bytes of the currently resident EVSM chain (moments + temp + scratch)
+     *  — feeds the preset-flip budget's "about to be freed" accounting. */
+    static long allocatedBytes()
+    {
+        long total = 0;
+        int shift = SpotlightDepthAtlas.evsmShift();
+        if (texId != 0)
+        {
+            total += ShadowAllocLog.mipChainBytes(SpotlightDepthAtlas.getAtlasWidth() >> shift,
+                SpotlightDepthAtlas.getAtlasHeight() >> shift, levels, 16L);
+        }
+        long side = Math.max(1, SpotlightDepthAtlas.getTileSize() >> shift);
+        if (tempId != 0)
+        {
+            total += side * side * 16L;
+        }
+        if (scratchId != 0)
+        {
+            total += side * side * 16L;
+        }
+        return total;
+    }
+
     /** Free the textures (called with SpotlightDepthAtlas.delete()). Deletion
      *  goes through GlStateManager — see SpotShadowPyramid.delete(). */
     public static void delete()

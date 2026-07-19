@@ -328,6 +328,24 @@ final class DepthTileAtlas
         return new int[] { textureId, fboId };
     }
 
+    /** Bytes of the currently resident depth layers (0 when nothing is
+     *  allocated) — feeds the preset-flip budget's "about to be freed"
+     *  accounting in {@link ShadowVramBudget}. */
+    public long allocatedBytes()
+    {
+        long layer = (long) this.getAtlasWidth() * this.getAtlasHeight() * 4L;
+        long total = 0;
+        if (this.glTextureId != 0)
+        {
+            total += layer;
+        }
+        if (this.staticTextureId != 0)
+        {
+            total += layer;
+        }
+        return total;
+    }
+
     /** Frees this atlas's own textures/FBOs only — cascading dependent
      *  filter storage (pyramid/EVSM) is the owning facade's job. */
     public void delete()

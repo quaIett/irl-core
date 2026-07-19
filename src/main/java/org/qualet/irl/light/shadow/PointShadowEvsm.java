@@ -58,6 +58,10 @@ public final class PointShadowEvsm
     private static final int[] texId = new int[3];   // MSM storage per tier: 2D-array, base = face/2, layers = blocks*6, levels = log2(faceSize)
     private static final int[] viewId = new int[3];  // CUBE_MAP_ARRAY texture view over texId[t]: hardware-seamless trilinear sampling (what the pack binds)
     private static final int[] levels = new int[3];
+    /** Blocks each tier's array physically backs (layers = blocks*6). Grown
+     *  in {@link ShadowVramBudget}-approved chunks by {@link #flushDirty};
+     *  0 until the tier's first dirty block. */
+    private static final int[] capBlocks = new int[3];
     /** ONE shared 6-layer ping-pong temp for the separable blur, sized for the
      *  LARGEST tier's lod-0 region (tileSize/2)^2 — every tier's region at
      *  every lod is smaller, so it always fits (the SpotShadowEvsm pattern). */
@@ -244,11 +248,12 @@ public final class PointShadowEvsm
         {
             return;
         }
-        ensureResources();
-        if (texId[0] == 0 || progConvert == 0 || progBlur == 0 || progMip == 0)
+        ensurePrograms();
+        if (progConvert == 0 || progBlur == 0 || progMip == 0)
         {
             return; // inert on failure — the GLSL size gate falls back to the PCF path
         }
+        ensureCapacities(mask);
 
         ShadowBakeProbe probe = ShadowEngine.bakeProbe();
         if (probe != null)
@@ -274,7 +279,9 @@ public final class PointShadowEvsm
         for (int t = 0; t < 3; t++)
         {
             int start = PointDepthAtlas.tierStartBlock(t);
-            int end = start + PointDepthAtlas.tierBlockCount(t);
+            // capBlocks-bounded: a block past the tier's physical capacity
+            // (growth denied by the budget) has no layers to write
+            int end = start + Math.min(PointDepthAtlas.tierBlockCount(t), capBlocks[t]);
             long tierBits = 0L;
             for (int b = start; b < end; b++)
             {
@@ -386,7 +393,46 @@ public final class PointShadowEvsm
         GL42.glMemoryBarrier(GL42.GL_TEXTURE_FETCH_BARRIER_BIT);
     }
 
-    private static void ensureResources()
+    /** Blocks of tier {@code t} the array physically backs (0 = none). */
+    static int allocatedBlocks(int t)
+    {
+        return capBlocks[t];
+    }
+
+    /** True when the compute programs failed to build — this filter will
+     *  never allocate or dispatch, so it must not constrain the budget. */
+    static boolean inert()
+    {
+        return programsAttempted && (progConvert == 0 || progBlur == 0 || progMip == 0);
+    }
+
+    /** Bytes of the currently resident tier arrays + blur temp — feeds the
+     *  preset-flip budget's "about to be freed" accounting. */
+    static long allocatedBytes()
+    {
+        long total = 0;
+        for (int t = 0; t < 3; t++)
+        {
+            if (capBlocks[t] > 0)
+            {
+                int base = PointDepthAtlas.tierFaceSizePx(t) / 2;
+                total += ShadowAllocLog.mipChainBytes(base, levels[t], 16L) * capBlocks[t] * 6L;
+            }
+        }
+        if (tempId != 0)
+        {
+            long half = PointDepthAtlas.getTileSize() / 2;
+            total += half * half * 6L * 16L;
+        }
+        return total;
+    }
+
+    /** Per-tier cooldown (in flushes) after a failed glTexStorage3D — bounds
+     *  the retry/log storm of a genuinely OOM'd card while still recovering
+     *  once VRAM frees up. */
+    private static final int[] growRetryDelay = new int[3];
+
+    private static void ensurePrograms()
     {
         if (!programsAttempted)
         {
@@ -419,60 +465,140 @@ public final class PointShadowEvsm
                 uMpDstSize = GL20.glGetUniformLocation(progMip, "dstSize");
             }
         }
-        if (progConvert == 0 || progBlur == 0 || progMip == 0 || texId[0] != 0)
-        {
-            return;
-        }
+    }
 
+    /** Grow every tier the dirty mask touches past its current capacity, up
+     *  to the budget-approved block count (demand-sized: a tier no lamp ever
+     *  ranks into never allocates). The shared blur temp allocates with the
+     *  first tier — sized (tileSize/2)^2, the largest any tier needs. */
+    private static void ensureCapacities(long mask)
+    {
         int prevArr = GL11.glGetInteger(GL30.GL_TEXTURE_BINDING_2D_ARRAY);
         for (int t = 0; t < 3; t++)
         {
-            levels[t] = Integer.numberOfTrailingZeros(Integer.highestOneBit(PointDepthAtlas.tierFaceSizePx(t)));
-            int base = PointDepthAtlas.tierFaceSizePx(t) / 2;
-
-            texId[t] = GL11.glGenTextures();
-            GL11.glBindTexture(GL30.GL_TEXTURE_2D_ARRAY, texId[t]);
-            GL43.glTexStorage3D(GL30.GL_TEXTURE_2D_ARRAY, levels[t], GL30.GL_RGBA32F, base, base, PointDepthAtlas.tierBlockCount(t) * 6);
-            ShadowAllocLog.log("point-evsm t" + t + " " + base + "^2 x" + (PointDepthAtlas.tierBlockCount(t) * 6) + " rgba32f",
-                ShadowAllocLog.mipChainBytes(base, levels[t], 16L) * PointDepthAtlas.tierBlockCount(t) * 6L);
-            GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_LINEAR_MIPMAP_LINEAR);
-            GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_LINEAR);
-            GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_WRAP_S, GL12.GL_CLAMP_TO_EDGE);
-            GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_WRAP_T, GL12.GL_CLAMP_TO_EDGE);
+            int start = PointDepthAtlas.tierStartBlock(t);
+            int needed = 0;
+            for (int b = start + PointDepthAtlas.tierBlockCount(t) - 1; b >= start; b--)
+            {
+                if ((mask & (1L << b)) != 0L)
+                {
+                    needed = b - start + 1;
+                    break;
+                }
+            }
+            if (needed > capBlocks[t] || (needed > 0 && texId[t] == 0))
+            {
+                if (growRetryDelay[t] > 0)
+                {
+                    growRetryDelay[t]--; // OOM cooldown; writes stay capBlocks-bounded
+                }
+                else
+                {
+                    // approved >= needed by the acquire-cap invariant; max() keeps
+                    // a stray block writable even if that invariant ever slips
+                    ensureTier(t, Math.max(needed, ShadowVramBudget.approvedPointBlocks(t)));
+                }
+            }
+        }
+        if (tempId == 0 && (capBlocks[0] > 0 || capBlocks[1] > 0 || capBlocks[2] > 0))
+        {
+            tempId = GL11.glGenTextures();
+            GL11.glBindTexture(GL30.GL_TEXTURE_2D_ARRAY, tempId);
+            GL43.glTexStorage3D(GL30.GL_TEXTURE_2D_ARRAY, 1, GL30.GL_RGBA32F,
+                PointDepthAtlas.getTileSize() / 2, PointDepthAtlas.getTileSize() / 2, 6);
+            ShadowAllocLog.log("point-evsm temp " + (PointDepthAtlas.getTileSize() / 2) + "^2 x6 rgba32f",
+                (long) (PointDepthAtlas.getTileSize() / 2) * (PointDepthAtlas.getTileSize() / 2) * 6L * 16L);
+            GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);
+            GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST);
             GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL12.GL_TEXTURE_BASE_LEVEL, 0);
-            GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL12.GL_TEXTURE_MAX_LEVEL, levels[t] - 1);
+            GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL12.GL_TEXTURE_MAX_LEVEL, 0);
+        }
+        GL11.glBindTexture(GL30.GL_TEXTURE_2D_ARRAY, prevArr);
+    }
+
+    /** (Re)allocate tier {@code t} at {@code targetBlocks} blocks (layers =
+     *  blocks*6, same level count), preserving the already-filtered layers of
+     *  the old array via a per-level GPU copy, then rebuild the CUBE_MAP_ARRAY
+     *  view (views require immutable storage — no in-place growth; the pack
+     *  binds the view id via IntSupplier, so a swap is picked up at the next
+     *  bind). Leaves GL_TEXTURE_2D_ARRAY bound to the new texture (the caller
+     *  restores). */
+    private static void ensureTier(int t, int targetBlocks)
+    {
+        targetBlocks = Math.min(targetBlocks, PointDepthAtlas.tierBlockCount(t));
+        if (targetBlocks <= capBlocks[t] && texId[t] != 0)
+        {
+            return;
+        }
+        int face = PointDepthAtlas.tierFaceSizePx(t);
+        int base = face / 2;
+        int lv = Integer.numberOfTrailingZeros(Integer.highestOneBit(face));
+        int newTex = GL11.glGenTextures();
+        GL11.glBindTexture(GL30.GL_TEXTURE_2D_ARRAY, newTex);
+        GL43.glTexStorage3D(GL30.GL_TEXTURE_2D_ARRAY, lv, GL30.GL_RGBA32F, base, base, targetBlocks * 6);
+        // GL_TEXTURE_IMMUTABLE_FORMAT flips to TRUE only on a successful
+        // glTexStorage* — on OOM the name has no storage: keep the old valid
+        // array (its filtered data AND its view) untouched, retry after a
+        // cooldown. Proceeding blind would glTextureView a storageless name
+        // and then delete the only good copy.
+        if (GL11.glGetTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL42.GL_TEXTURE_IMMUTABLE_FORMAT) != GL11.GL_TRUE)
+        {
+            GL11.glDeleteTextures(newTex);
+            growRetryDelay[t] = 600;
+            System.err.println("[irl-core] PointShadowEvsm: t" + t + " glTexStorage3D "
+                + base + "^2 x" + (targetBlocks * 6) + " failed (VRAM?); keeping "
+                + capBlocks[t] + " blocks, retry in " + growRetryDelay[t] + " flushes");
+            return;
+        }
+        ShadowAllocLog.log("point-evsm t" + t + " " + base + "^2 x" + (targetBlocks * 6)
+                + "/" + (PointDepthAtlas.tierBlockCount(t) * 6) + " rgba32f",
+            ShadowAllocLog.mipChainBytes(base, lv, 16L) * targetBlocks * 6L);
+        GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_LINEAR_MIPMAP_LINEAR);
+        GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_LINEAR);
+        GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_WRAP_S, GL12.GL_CLAMP_TO_EDGE);
+        GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_WRAP_T, GL12.GL_CLAMP_TO_EDGE);
+        GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL12.GL_TEXTURE_BASE_LEVEL, 0);
+        GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL12.GL_TEXTURE_MAX_LEVEL, lv - 1);
+        if (texId[t] != 0 && capBlocks[t] > 0)
+        {
+            // order prior imageStore writes before the copy reads them
+            GL42.glMemoryBarrier(GL42.GL_ALL_BARRIER_BITS);
+            for (int lod = 0; lod < lv; lod++)
+            {
+                int w = Math.max(1, base >> lod);
+                GL43.glCopyImageSubData(texId[t], GL30.GL_TEXTURE_2D_ARRAY, lod, 0, 0, 0,
+                    newTex, GL30.GL_TEXTURE_2D_ARRAY, lod, 0, 0, 0, w, w, capBlocks[t] * 6);
+            }
         }
 
-        tempId = GL11.glGenTextures();
-        GL11.glBindTexture(GL30.GL_TEXTURE_2D_ARRAY, tempId);
-        GL43.glTexStorage3D(GL30.GL_TEXTURE_2D_ARRAY, 1, GL30.GL_RGBA32F,
-            PointDepthAtlas.getTileSize() / 2, PointDepthAtlas.getTileSize() / 2, 6);
-        ShadowAllocLog.log("point-evsm temp " + (PointDepthAtlas.getTileSize() / 2) + "^2 x6 rgba32f",
-            (long) (PointDepthAtlas.getTileSize() / 2) * (PointDepthAtlas.getTileSize() / 2) * 6L * 16L);
-        GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);
-        GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST);
-        GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL12.GL_TEXTURE_BASE_LEVEL, 0);
-        GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL12.GL_TEXTURE_MAX_LEVEL, 0);
-
-        GL11.glBindTexture(GL30.GL_TEXTURE_2D_ARRAY, prevArr);
-
-        // cube views over the same storage (immutable glTexStorage3D, blocks*6
+        // cube view over the new storage (immutable glTexStorage3D, blocks*6
         // layers): the pack samples THESE ids — seamless cubemap filtering
         // handles face edges at every mip. The context-global seamless enable
         // lives HERE (see GL_TEXTURE_CUBE_MAP_SEAMLESS above).
         GL11.glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS);
         int prevCubeArr = GL11.glGetInteger(GL40.GL_TEXTURE_BINDING_CUBE_MAP_ARRAY);
-        for (int t = 0; t < 3; t++)
-        {
-            viewId[t] = GL11.glGenTextures();
-            GL43.glTextureView(viewId[t], GL40.GL_TEXTURE_CUBE_MAP_ARRAY, texId[t], GL30.GL_RGBA32F, 0, levels[t], 0, PointDepthAtlas.tierBlockCount(t) * 6);
-            GL11.glBindTexture(GL40.GL_TEXTURE_CUBE_MAP_ARRAY, viewId[t]);
-            GL11.glTexParameteri(GL40.GL_TEXTURE_CUBE_MAP_ARRAY, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_LINEAR_MIPMAP_LINEAR);
-            GL11.glTexParameteri(GL40.GL_TEXTURE_CUBE_MAP_ARRAY, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_LINEAR);
-            GL11.glTexParameteri(GL40.GL_TEXTURE_CUBE_MAP_ARRAY, GL12.GL_TEXTURE_BASE_LEVEL, 0);
-            GL11.glTexParameteri(GL40.GL_TEXTURE_CUBE_MAP_ARRAY, GL12.GL_TEXTURE_MAX_LEVEL, levels[t] - 1);
-        }
+        int newView = GL11.glGenTextures();
+        GL43.glTextureView(newView, GL40.GL_TEXTURE_CUBE_MAP_ARRAY, newTex, GL30.GL_RGBA32F, 0, lv, 0, targetBlocks * 6);
+        GL11.glBindTexture(GL40.GL_TEXTURE_CUBE_MAP_ARRAY, newView);
+        GL11.glTexParameteri(GL40.GL_TEXTURE_CUBE_MAP_ARRAY, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_LINEAR_MIPMAP_LINEAR);
+        GL11.glTexParameteri(GL40.GL_TEXTURE_CUBE_MAP_ARRAY, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_LINEAR);
+        GL11.glTexParameteri(GL40.GL_TEXTURE_CUBE_MAP_ARRAY, GL12.GL_TEXTURE_BASE_LEVEL, 0);
+        GL11.glTexParameteri(GL40.GL_TEXTURE_CUBE_MAP_ARRAY, GL12.GL_TEXTURE_MAX_LEVEL, lv - 1);
         GL11.glBindTexture(GL40.GL_TEXTURE_CUBE_MAP_ARRAY, prevCubeArr);
+
+        if (viewId[t] != 0)
+        {
+            GL11.glDeleteTextures(viewId[t]);
+        }
+        if (texId[t] != 0)
+        {
+            GL11.glDeleteTextures(texId[t]);
+        }
+        viewId[t] = newView;
+        texId[t] = newTex;
+        levels[t] = lv;
+        capBlocks[t] = targetBlocks;
+        GL11.glBindTexture(GL30.GL_TEXTURE_2D_ARRAY, newTex);
     }
 
     private static int buildProgram(String src, String tag)
@@ -516,6 +642,8 @@ public final class PointShadowEvsm
                 texId[t] = 0;
             }
             levels[t] = 0;
+            capBlocks[t] = 0;
+            growRetryDelay[t] = 0;
         }
         if (tempId != 0)
         {

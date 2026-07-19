@@ -41,6 +41,10 @@ public final class PointShadowPyramid
 {
     private static final int[] texId = new int[3];   // one 2D-array per tier
     private static final int[] levels = new int[3];
+    /** Blocks each tier's array physically backs (layers = blocks*6). Grown
+     *  in {@link ShadowVramBudget}-approved chunks by {@link #flushDirty};
+     *  0 until the tier's first dirty block. */
+    private static final int[] capBlocks = new int[3];
     /** One bit per GLOBAL block (1L << block); long because the atlas layout
      *  allows up to 64 blocks (guarded in PointDepthAtlas). */
     private static long dirtyMask = 0L;
@@ -155,11 +159,12 @@ public final class PointShadowPyramid
         {
             return;
         }
-        ensureResources();
-        if (texId[0] == 0 || progCube == 0 || progMip == 0)
+        ensurePrograms();
+        if (progCube == 0 || progMip == 0)
         {
             return; // inert on failure — the GLSL pyrMax>0 guard falls back to full PCSS
         }
+        ensureCapacities(mask);
 
         ShadowBakeProbe probe = ShadowEngine.bakeProbe();
         if (probe != null)
@@ -190,7 +195,9 @@ public final class PointShadowPyramid
         {
             int base = PointDepthAtlas.tierFaceSizePx(t) / 2;
             int start = PointDepthAtlas.tierStartBlock(t);
-            int end = start + PointDepthAtlas.tierBlockCount(t);
+            // capBlocks-bounded: a block past the tier's physical capacity
+            // (growth denied by the budget) has no layers to write
+            int end = start + Math.min(PointDepthAtlas.tierBlockCount(t), capBlocks[t]);
             boolean bound = false;
             for (int b = start; b < end; b++)
             {
@@ -219,7 +226,7 @@ public final class PointShadowPyramid
         for (int t = 0; t < 3; t++)
         {
             int start = PointDepthAtlas.tierStartBlock(t);
-            int end = start + PointDepthAtlas.tierBlockCount(t);
+            int end = start + Math.min(PointDepthAtlas.tierBlockCount(t), capBlocks[t]);
             long tierBits = 0L;
             for (int b = start; b < end; b++)
             {
@@ -264,52 +271,157 @@ public final class PointShadowPyramid
         }
     }
 
-    private static void ensureResources()
+    /** Blocks of tier {@code t} the array physically backs (0 = none). */
+    static int allocatedBlocks(int t)
     {
-        if (!programsAttempted)
+        return capBlocks[t];
+    }
+
+    /** True when the compute programs failed to build — this filter will
+     *  never allocate or dispatch, so it must not constrain the budget. */
+    static boolean inert()
+    {
+        return programsAttempted && (progCube == 0 || progMip == 0);
+    }
+
+    /** Bytes of the currently resident tier arrays — feeds the preset-flip
+     *  budget's "about to be freed" accounting. */
+    static long allocatedBytes()
+    {
+        long total = 0;
+        for (int t = 0; t < 3; t++)
         {
-            programsAttempted = true;
-            progCube = buildProgram(CUBE_SRC, "cube");
-            progMip = buildProgram(MIP_SRC, "mip");
-            if (progCube != 0)
+            if (capBlocks[t] > 0)
             {
-                uCubeSrc = GL20.glGetUniformLocation(progCube, "srcAtlas");
-                uCubeSlot = GL20.glGetUniformLocation(progCube, "slot");
-                uCubeDstSize = GL20.glGetUniformLocation(progCube, "dstSize");
-                uCubeBlockOrigin = GL20.glGetUniformLocation(progCube, "blockOrigin");
-            }
-            if (progMip != 0)
-            {
-                uMipSrc = GL20.glGetUniformLocation(progMip, "srcFlat");
-                uMipSrcLod = GL20.glGetUniformLocation(progMip, "srcLod");
-                uMipLayerBase = GL20.glGetUniformLocation(progMip, "layerBase");
-                uMipDstSize = GL20.glGetUniformLocation(progMip, "dstSize");
+                int base = PointDepthAtlas.tierFaceSizePx(t) / 2;
+                total += ShadowAllocLog.mipChainBytes(base, levels[t], 8L) * capBlocks[t] * 6L;
             }
         }
-        if (progCube == 0 || progMip == 0 || texId[0] != 0)
+        return total;
+    }
+
+    /** Per-tier cooldown (in flushes) after a failed glTexStorage3D — bounds
+     *  the retry/log storm of a genuinely OOM'd card while still recovering
+     *  once VRAM frees up. */
+    private static final int[] growRetryDelay = new int[3];
+
+    private static void ensurePrograms()
+    {
+        if (programsAttempted)
         {
             return;
         }
+        programsAttempted = true;
+        progCube = buildProgram(CUBE_SRC, "cube");
+        progMip = buildProgram(MIP_SRC, "mip");
+        if (progCube != 0)
+        {
+            uCubeSrc = GL20.glGetUniformLocation(progCube, "srcAtlas");
+            uCubeSlot = GL20.glGetUniformLocation(progCube, "slot");
+            uCubeDstSize = GL20.glGetUniformLocation(progCube, "dstSize");
+            uCubeBlockOrigin = GL20.glGetUniformLocation(progCube, "blockOrigin");
+        }
+        if (progMip != 0)
+        {
+            uMipSrc = GL20.glGetUniformLocation(progMip, "srcFlat");
+            uMipSrcLod = GL20.glGetUniformLocation(progMip, "srcLod");
+            uMipLayerBase = GL20.glGetUniformLocation(progMip, "layerBase");
+            uMipDstSize = GL20.glGetUniformLocation(progMip, "dstSize");
+        }
+    }
 
+    /** Grow every tier the dirty mask touches past its current capacity, up
+     *  to the budget-approved block count (demand-sized: a tier no lamp ever
+     *  ranks into never allocates). */
+    private static void ensureCapacities(long mask)
+    {
         int prevArr = GL11.glGetInteger(GL30.GL_TEXTURE_BINDING_2D_ARRAY);
         for (int t = 0; t < 3; t++)
         {
-            texId[t] = GL11.glGenTextures();
-            GL11.glBindTexture(GL30.GL_TEXTURE_2D_ARRAY, texId[t]);
-            // base = face/2; levels = log2(faceSize): the deepest lod is one texel per face
-            levels[t] = Integer.numberOfTrailingZeros(Integer.highestOneBit(PointDepthAtlas.tierFaceSizePx(t)));
-            int base = PointDepthAtlas.tierFaceSizePx(t) / 2;
-            GL43.glTexStorage3D(GL30.GL_TEXTURE_2D_ARRAY, levels[t], GL30.GL_RG32F, base, base, PointDepthAtlas.tierBlockCount(t) * 6);
-            ShadowAllocLog.log("point-pyr t" + t + " " + base + "^2 x" + (PointDepthAtlas.tierBlockCount(t) * 6) + " rg32f",
-                ShadowAllocLog.mipChainBytes(base, levels[t], 8L) * PointDepthAtlas.tierBlockCount(t) * 6L);
-            GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);
-            GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST);
-            GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_WRAP_S, GL12.GL_CLAMP_TO_EDGE);
-            GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_WRAP_T, GL12.GL_CLAMP_TO_EDGE);
-            GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL12.GL_TEXTURE_BASE_LEVEL, 0);
-            GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL12.GL_TEXTURE_MAX_LEVEL, levels[t] - 1);
+            int start = PointDepthAtlas.tierStartBlock(t);
+            int needed = 0;
+            for (int b = start + PointDepthAtlas.tierBlockCount(t) - 1; b >= start; b--)
+            {
+                if ((mask & (1L << b)) != 0L)
+                {
+                    needed = b - start + 1;
+                    break;
+                }
+            }
+            if (needed > capBlocks[t] || (needed > 0 && texId[t] == 0))
+            {
+                if (growRetryDelay[t] > 0)
+                {
+                    growRetryDelay[t]--; // OOM cooldown; writes stay capBlocks-bounded
+                }
+                else
+                {
+                    // approved >= needed by the acquire-cap invariant; max() keeps
+                    // a stray block writable even if that invariant ever slips
+                    ensureTier(t, Math.max(needed, ShadowVramBudget.approvedPointBlocks(t)));
+                }
+            }
         }
         GL11.glBindTexture(GL30.GL_TEXTURE_2D_ARRAY, prevArr);
+    }
+
+    /** (Re)allocate tier {@code t} at {@code targetBlocks} blocks (layers =
+     *  blocks*6, same level count), preserving the already-filtered layers of
+     *  the old array via a per-level GPU copy — growth must not force a
+     *  re-bake of untouched blocks. Leaves GL_TEXTURE_2D_ARRAY bound to the
+     *  new texture (the caller restores). */
+    private static void ensureTier(int t, int targetBlocks)
+    {
+        targetBlocks = Math.min(targetBlocks, PointDepthAtlas.tierBlockCount(t));
+        if (targetBlocks <= capBlocks[t] && texId[t] != 0)
+        {
+            return;
+        }
+        int face = PointDepthAtlas.tierFaceSizePx(t);
+        int base = face / 2;
+        int lv = Integer.numberOfTrailingZeros(Integer.highestOneBit(face));
+        int newTex = GL11.glGenTextures();
+        GL11.glBindTexture(GL30.GL_TEXTURE_2D_ARRAY, newTex);
+        GL43.glTexStorage3D(GL30.GL_TEXTURE_2D_ARRAY, lv, GL30.GL_RG32F, base, base, targetBlocks * 6);
+        // GL_TEXTURE_IMMUTABLE_FORMAT flips to TRUE only on a successful
+        // glTexStorage* — on OOM the name has no storage: keep the old valid
+        // array (and its filtered data) untouched and retry after a cooldown
+        if (GL11.glGetTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL42.GL_TEXTURE_IMMUTABLE_FORMAT) != GL11.GL_TRUE)
+        {
+            GL11.glDeleteTextures(newTex);
+            growRetryDelay[t] = 600;
+            System.err.println("[irl-core] PointShadowPyramid: t" + t + " glTexStorage3D "
+                + base + "^2 x" + (targetBlocks * 6) + " failed (VRAM?); keeping "
+                + capBlocks[t] + " blocks, retry in " + growRetryDelay[t] + " flushes");
+            return;
+        }
+        ShadowAllocLog.log("point-pyr t" + t + " " + base + "^2 x" + (targetBlocks * 6)
+                + "/" + (PointDepthAtlas.tierBlockCount(t) * 6) + " rg32f",
+            ShadowAllocLog.mipChainBytes(base, lv, 8L) * targetBlocks * 6L);
+        GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);
+        GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST);
+        GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_WRAP_S, GL12.GL_CLAMP_TO_EDGE);
+        GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_WRAP_T, GL12.GL_CLAMP_TO_EDGE);
+        GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL12.GL_TEXTURE_BASE_LEVEL, 0);
+        GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL12.GL_TEXTURE_MAX_LEVEL, lv - 1);
+        if (texId[t] != 0 && capBlocks[t] > 0)
+        {
+            // order prior imageStore writes before the copy reads them
+            GL42.glMemoryBarrier(GL42.GL_ALL_BARRIER_BITS);
+            for (int lod = 0; lod < lv; lod++)
+            {
+                int w = Math.max(1, base >> lod);
+                GL43.glCopyImageSubData(texId[t], GL30.GL_TEXTURE_2D_ARRAY, lod, 0, 0, 0,
+                    newTex, GL30.GL_TEXTURE_2D_ARRAY, lod, 0, 0, 0, w, w, capBlocks[t] * 6);
+            }
+        }
+        if (texId[t] != 0)
+        {
+            GL11.glDeleteTextures(texId[t]);
+        }
+        texId[t] = newTex;
+        levels[t] = lv;
+        capBlocks[t] = targetBlocks;
     }
 
     private static int buildProgram(String src, String tag)
@@ -349,6 +461,8 @@ public final class PointShadowPyramid
                 texId[t] = 0;
             }
             levels[t] = 0;
+            capBlocks[t] = 0;
+            growRetryDelay[t] = 0;
         }
         clearAll();
     }

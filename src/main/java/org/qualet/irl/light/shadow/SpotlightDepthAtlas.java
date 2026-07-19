@@ -193,14 +193,50 @@ public final class SpotlightDepthAtlas
 
     /** Switch tile resolution; frees + re-inits both atlases on next access.
      *  The filter cascade in {@link #delete()} is mandatory — pyramid/EVSM
-     *  level counts and temp storage derive from the tile size. */
+     *  level counts and temp storage derive from the tile size.
+     *  The requested size is clamped down (power-of-two steps) so the 4T
+     *  atlas fits GL_MAX_TEXTURE_SIZE, and so the chain's full VRAM
+     *  footprint (spot filter textures are atlas-sized, so full = minimal
+     *  once any spotlight exists) fits the chain's budget — see
+     *  {@link ShadowVramBudget#spotFullFootprintBytes}. NOTE: the estimate
+     *  reads {@link #evsmShift()}, so {@link IRLShadowQuality#apply} must
+     *  set the shift BEFORE the tile size. */
     public static void setTileSize(int newSize)
     {
-        if (newSize == INSTANCE.getTileSize())
+        int maxTex = org.lwjgl.opengl.GL11.glGetInteger(org.lwjgl.opengl.GL11.GL_MAX_TEXTURE_SIZE);
+        int size = newSize;
+        while (size > 256 && size * 4 > maxTex)
+        {
+            size >>= 1;
+        }
+        if (size != newSize)
+        {
+            System.err.println("[irl-core] SpotlightDepthAtlas: tile size " + newSize
+                + " needs a " + (newSize * 4) + "px atlas > GL_MAX_TEXTURE_SIZE "
+                + maxTex + "; clamped to " + size);
+        }
+        long resident = INSTANCE.allocatedBytes()
+            + SpotShadowPyramid.allocatedBytes() + SpotShadowEvsm.allocatedBytes();
+        long budget = ShadowVramBudget.chainBudgetBytes(resident);
+        long cap = budget >= 0 ? budget : ShadowVramBudget.FALLBACK_CHAIN_BYTES;
+        int preBudget = size;
+        while (size > 256 && ShadowVramBudget.spotFullFootprintBytes(size, evsmShift) > cap)
+        {
+            size >>= 1;
+        }
+        if (size != preBudget)
+        {
+            System.out.println("[irl-core] SpotlightDepthAtlas: tile size " + preBudget
+                + " needs " + (ShadowVramBudget.spotFullFootprintBytes(preBudget, evsmShift) >> 20)
+                + " MiB > chain budget " + (cap >> 20) + " MiB"
+                + (budget < 0 ? " (free VRAM unqueryable, fallback cap)" : "")
+                + "; clamped to " + size);
+        }
+        if (size == INSTANCE.getTileSize())
         {
             return;
         }
         delete();
-        INSTANCE.setTileSize(newSize);
+        INSTANCE.setTileSize(size);
     }
 }
