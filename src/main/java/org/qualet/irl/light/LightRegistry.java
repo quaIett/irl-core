@@ -359,6 +359,14 @@ public final class LightRegistry
         uploadCap = cap;
     }
 
+    /** How many lights the last {@link #flush(double, double, double)} actually
+     *  packed into the SSBO (after the upload cap and bake-throttle omissions).
+     *  Telemetry: distinguishes "registered" from "paid for by the shader loop". */
+    public static int getUploadedCount()
+    {
+        return uploadedCount;
+    }
+
     /** Fill {@link #order}[0,count) with light indices sorted by ascending
      *  priority score (see {@link #prioritize}); scores are computed in double so
      *  a light far from origin keeps full distance precision. */
@@ -520,10 +528,11 @@ public final class LightRegistry
             // Snapshot this light for Phase 3 clustering: uploadedCount is the SAME
             // pre-increment cursor that indexes uploadedIds below, so it is this
             // light's PACKED index in the SSBO (binding 7) — i.e. its cluster mask
-            // bit. Only the first MASK_LIGHTS get bits; the shader runs the tail
-            // unmasked. Positions are the camera-relative rx/ry/rz computed above;
-            // tiles are projected later, in ClusterGridBuffer.buildAndUpload.
-            if (uploadedCount < ClusterGridBuffer.MASK_LIGHTS)
+            // bit. W2: EVERY packed light gets a wide-region bit (the legacy uvec2
+            // region still mirrors the first MASK_LIGHTS for old-generation packs).
+            // Positions are the camera-relative rx/ry/rz computed above; tiles are
+            // projected later, in ClusterGridBuffer.buildAndUpload.
+            if (uploadedCount < ClusterGridBuffer.WIDE_LIGHTS)
             {
                 ClusterGridBuffer.record(uploadedCount, rx, ry, rz, radius[i]);
             }

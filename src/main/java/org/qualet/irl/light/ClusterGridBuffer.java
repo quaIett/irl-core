@@ -16,19 +16,25 @@ import java.util.Arrays;
  * surface shader can skip lights whose screen-space bound doesn't cover the
  * fragment's tile instead of looping every light per fragment.
  *
- * <p>std430 contract (the CR-pilot GLSL mirrors this exactly):</p>
+ * <p>std430 contract, W2 dual-region (the CR-pilot GLSL mirrors this exactly):</p>
  *
  * <pre>
- *   layout(std430, binding = BINDING) buffer IrliteClusterGrid {
- *       uvec4 irlite_clusterHeader;   // x=gridX, y=gridY, z=flags (1=active, 0=fall back to full loop), w=0
- *       uvec2 irlite_clusterMasks[];  // row-major ty*gridX+tx, ORIGIN BOTTOM-LEFT (matches gl_FragCoord);
- *                                     // bit i of .x (i<32) / .y (32<=i<64) == packed light index i in binding 7
+ *   layout(std430, binding = BINDING) readonly buffer IrliteClusterGrid {
+ *       uvec4 irlite_clusterHeader;      // x=gridX, y=gridY, z=flags (1=active, 0=fall back to full loop),
+ *                                        // w=words-per-tile of the wide region (0 = legacy-only writer)
+ *       uvec2 irlite_clusterMasks[576];  // LEGACY region, row-major ty*gridX+tx, ORIGIN BOTTOM-LEFT
+ *                                        // (matches gl_FragCoord); bit i of .x (i&lt;32) / .y (32&lt;=i&lt;64)
+ *                                        // == packed light index i in binding 7. Still dual-written so
+ *                                        // old-generation packs keep culling their first 64.
+ *       uint  irlite_clusterWide[];      // W2 wide region, tile-major [tile * header.w + (i&gt;&gt;5)],
+ *                                        // bit (i&amp;31) == packed light index i — EVERY packed light has a bit
  *   };
  * </pre>
  *
- * <p>Only the first {@link #MASK_LIGHTS} packed lights (the PACKED index in the
- * light SSBO, after cap / SHADOW_PENDING skips) get mask bits; the shader lets
- * index &gt;= 64 pass unmasked (tail = full cost, matches the clamp-to-64 plan).</p>
+ * <p>W2: every packed light (the PACKED index in the light SSBO, after cap /
+ * SHADOW_PENDING skips) gets a wide-region bit; new-generation shaders have no
+ * unmasked tail. The legacy 64-bit region keeps the first {@link #MASK_LIGHTS}
+ * mirrored for old-generation packs, which still run index &gt;= 64 unmasked.</p>
  *
  * <p>Lifecycle mirrors {@link LightBuffer}: lazy GL init, off-heap scratch,
  * glBufferSubData + glBindBufferBase(binding {@value #BINDING}), and an
@@ -43,15 +49,24 @@ public final class ClusterGridBuffer
     public static final int BINDING = 6;
     public static final int GRID_X = 32;
     public static final int GRID_Y = 18;
-    /** Packed lights at or past this index get no mask bits (shader runs them unmasked). */
+    /** Width of the LEGACY uvec2 mask region: packed lights past this index have
+     *  no bits THERE. Old-generation patched packs read only this region, so it
+     *  stays in the layout and keeps being dual-written (first 64 bits). */
     public static final int MASK_LIGHTS = 64;
+    /** W2 wide region (red-line experiment): words-per-tile of the full-width
+     *  mask — EVERY packed light up to {@link LightBuffer#MAX_LIGHTS} gets a
+     *  bit, killing the 64-light cluster ceiling. Header .w carries this value
+     *  so the shader can gate on it (0 = legacy-only mod, full-loop fallback). */
+    public static final int WIDE_WORDS = (LightBuffer.MAX_LIGHTS + 31) / 32;   // 64; ceil so WIDE_LIGHTS >= MAX_LIGHTS by construction
+    public static final int WIDE_LIGHTS = WIDE_WORDS * 32;                     // 2048
     /** View-space near plane used by the mask projection (the pilot's NEAR). */
     public static final float NEAR = 0.05F;
 
     private static final int TILE_COUNT = GRID_X * GRID_Y;   // 576
     private static final int HEADER_BYTES = 16;              // uvec4
-    private static final int MASK_BYTES = TILE_COUNT * 8;    // uvec2 (2×uint) per tile
-    private static final int CAPACITY = HEADER_BYTES + MASK_BYTES;
+    private static final int MASK_BYTES = TILE_COUNT * 8;    // legacy uvec2 (2×uint) per tile
+    private static final int WIDE_BYTES = TILE_COUNT * WIDE_WORDS * 4;  // wide uint words per tile
+    private static final int CAPACITY = HEADER_BYTES + MASK_BYTES + WIDE_BYTES;
 
     // Camera-inside-sphere slack: length(view) <= r * this floods every tile. A hair
     // over 1 so a fragment sitting on the sphere surface can't slip between the
@@ -70,19 +85,22 @@ public final class ClusterGridBuffer
 
     private static int ssbo = 0;
     private static ByteBuffer scratch = null;
+    /** Cached IntBuffer view over the wide region of {@link #scratch} (created
+     *  once in init — a per-frame asIntBuffer() would allocate in the frame path). */
+    private static java.nio.IntBuffer wideView = null;
     private static boolean initialized = false;
 
     // --- Runtime toggle ------------------------------------------------------
     private static boolean enabled = true;
 
     // --- Per-frame snapshot (recorded during LightRegistry.flush) ------------
-    // Camera-relative light position + radius for the first MASK_LIGHTS packed
-    // lights, indexed by packed index (index i == mask bit i). Projected to tiles
+    // Camera-relative light position + radius for EVERY packed light (W2),
+    // indexed by packed index (index i == mask bit i). Projected to tiles
     // later, in buildAndUpload, against the captured gbuffer matrices.
-    private static final float[] snapRx = new float[MASK_LIGHTS];
-    private static final float[] snapRy = new float[MASK_LIGHTS];
-    private static final float[] snapRz = new float[MASK_LIGHTS];
-    private static final float[] snapRadius = new float[MASK_LIGHTS];
+    private static final float[] snapRx = new float[WIDE_LIGHTS];
+    private static final float[] snapRy = new float[WIDE_LIGHTS];
+    private static final float[] snapRz = new float[WIDE_LIGHTS];
+    private static final float[] snapRadius = new float[WIDE_LIGHTS];
     private static int snapCount = 0;
     // Set by markSnapshotFresh() at flush end, cleared by buildAndUpload: the
     // frame-consistency guard so a late hook that fired without a snapshot recorded
@@ -90,8 +108,10 @@ public final class ClusterGridBuffer
     private static boolean snapshotFresh = false;
 
     // --- Mask accumulator (CPU-side, reused; row-major ty*GRID_X+tx) ---------
-    private static final int[] maskX = new int[TILE_COUNT];  // bits 0..31
-    private static final int[] maskY = new int[TILE_COUNT];  // bits 32..63
+    private static final int[] maskX = new int[TILE_COUNT];  // legacy bits 0..31
+    private static final int[] maskY = new int[TILE_COUNT];  // legacy bits 32..63
+    // W2 full-width words, tile-major [t * WIDE_WORDS + (bit >> 5)].
+    private static final int[] wide = new int[TILE_COUNT * WIDE_WORDS];
 
     // Reused transform scratch — buildAndUpload stays allocation-free per frame.
     private static final Vector4f v4 = new Vector4f();
@@ -119,6 +139,9 @@ public final class ClusterGridBuffer
         GL15.glBindBuffer(GL43.GL_SHADER_STORAGE_BUFFER, 0);
 
         scratch = MemoryUtil.memAlloc(CAPACITY);
+        scratch.position(HEADER_BYTES + MASK_BYTES);
+        wideView = scratch.asIntBuffer();
+        scratch.clear();
 
         initialized = true;
     }
@@ -150,10 +173,11 @@ public final class ClusterGridBuffer
      *  for uploadedIds — and becomes mask bit {@code bit}. Positions are
      *  camera-relative (already computed by flush); projection to tiles happens
      *  later, in {@link #buildAndUpload}. No-op when disabled or when
-     *  {@code bit >= MASK_LIGHTS} (those lights run unmasked in the shader tail). */
+     *  {@code bit >= WIDE_LIGHTS} (cannot happen while WIDE_LIGHTS ==
+     *  {@link LightBuffer#MAX_LIGHTS} — kept as a guard). */
     public static void record(int bit, float rx, float ry, float rz, float radius)
     {
-        if (!enabled || bit < 0 || bit >= MASK_LIGHTS)
+        if (!enabled || bit < 0 || bit >= WIDE_LIGHTS)
         {
             return;
         }
@@ -197,6 +221,7 @@ public final class ClusterGridBuffer
 
         Arrays.fill(maskX, 0);
         Arrays.fill(maskY, 0);
+        Arrays.fill(wide, 0);
 
         for (int b = 0; b < snapCount; b++)
         {
@@ -286,49 +311,41 @@ public final class ClusterGridBuffer
         if (tx1 > GRID_X - 1) tx1 = GRID_X - 1;
         if (ty1 > GRID_Y - 1) ty1 = GRID_Y - 1;
 
-        if (bit < 32)
+        int word = bit >> 5;
+        int m = 1 << (bit & 31);
+        for (int ty = ty0; ty <= ty1; ty++)
         {
-            int m = 1 << bit;
-            for (int ty = ty0; ty <= ty1; ty++)
+            int row = ty * GRID_X;
+            for (int tx = tx0; tx <= tx1; tx++)
             {
-                int row = ty * GRID_X;
-                for (int tx = tx0; tx <= tx1; tx++)
-                {
-                    maskX[row + tx] |= m;
-                }
-            }
-        }
-        else
-        {
-            int m = 1 << (bit - 32);
-            for (int ty = ty0; ty <= ty1; ty++)
-            {
-                int row = ty * GRID_X;
-                for (int tx = tx0; tx <= tx1; tx++)
-                {
-                    maskY[row + tx] |= m;
-                }
+                setTileBit(row + tx, word, bit, m);
             }
         }
     }
 
     private static void setAllTiles(int bit)
     {
+        int word = bit >> 5;
+        int m = 1 << (bit & 31);
+        for (int t = 0; t < TILE_COUNT; t++)
+        {
+            setTileBit(t, word, bit, m);
+        }
+    }
+
+    /** OR light {@code bit}'s mask bit into tile {@code t}: always into the W2
+     *  wide region, mirrored into the legacy uvec2 region for the first
+     *  {@value #MASK_LIGHTS} bits (old-generation packs read only that). */
+    private static void setTileBit(int t, int word, int bit, int m)
+    {
+        wide[t * WIDE_WORDS + word] |= m;
         if (bit < 32)
         {
-            int m = 1 << bit;
-            for (int t = 0; t < TILE_COUNT; t++)
-            {
-                maskX[t] |= m;
-            }
+            maskX[t] |= m;
         }
-        else
+        else if (bit < MASK_LIGHTS)
         {
-            int m = 1 << (bit - 32);
-            for (int t = 0; t < TILE_COUNT; t++)
-            {
-                maskY[t] |= m;
-            }
+            maskY[t] |= m;
         }
     }
 
@@ -337,11 +354,18 @@ public final class ClusterGridBuffer
     private static void writeAndUpload(int flags)
     {
         scratch.clear();
-        scratch.putInt(GRID_X).putInt(GRID_Y).putInt(flags).putInt(0);
+        scratch.putInt(GRID_X).putInt(GRID_Y).putInt(flags).putInt(WIDE_WORDS);
         for (int t = 0; t < TILE_COUNT; t++)
         {
             scratch.putInt(maskX[t]).putInt(maskY[t]);
         }
+        // W2 wide region, bulk-copied through the cached IntBuffer view (a putInt
+        // loop over 36,864 words would cost real per-frame CPU; a per-frame
+        // asIntBuffer() would allocate). The view is anchored at the wide region's
+        // fixed offset and shares the scratch buffer's native byte order.
+        wideView.clear();
+        wideView.put(wide);
+        scratch.position(scratch.position() + WIDE_BYTES);
         scratch.flip();
 
         GL15.glBindBuffer(GL43.GL_SHADER_STORAGE_BUFFER, ssbo);
@@ -404,6 +428,7 @@ public final class ClusterGridBuffer
         {
             MemoryUtil.memFree(scratch);
             scratch = null;
+            wideView = null;
         }
 
         initialized = false;
