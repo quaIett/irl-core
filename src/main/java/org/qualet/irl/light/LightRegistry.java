@@ -391,10 +391,12 @@ public final class LightRegistry
             {
                 s -= BEAM_BONUS;
             }
-            if (s < 0.0)
-            {
-                s = 0.0;
-            }
+            // Deliberately NOT clamped to zero after the discounts: the score is
+            // only ever a sort key, so letting it go negative keeps every light
+            // ranked by distance. Clamping collapsed all beam lights within
+            // BEAM_BONUS blocks to a single score, degenerating their order to
+            // the id tie-break — a lamp two blocks away could lose its upload
+            // slot to one sixty blocks away whenever demand exceeded the cap.
             priorityScore[i] = s;
             order[i] = i;
         }
