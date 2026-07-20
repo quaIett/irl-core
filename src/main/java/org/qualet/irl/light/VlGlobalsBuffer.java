@@ -16,15 +16,28 @@ import java.nio.ByteBuffer;
  *   layout(std140, binding = BINDING) uniform IrliteVlGlobals {
  *       vec4 irlite_vlA;   // x = intensity, y = maxDist, z = tipBoost, w = tipRadius
  *       vec4 irlite_vlB;   // x = noiseAmount, y = noiseScale, z = noiseSpeed, w = frameIndex (wraps at 4096)
- *       uvec4 irlite_vlC;  // x = stepMax, y = shadowStride, z = noiseStride, w = flags (bit0 = VL shadows, bit1 = VL noise, bit2 = blue-noise dither, bit3 = temporal dither rotation, bit4 = VL cluster culling, bit5 = VL shadow Hi-Z segment skip, bit6 = depth-aware bilateral upsample)
+ *       uvec4 irlite_vlC;  // x = stepMax, y = shadowStride, z = noiseStride, w = flags (bit0 = VL shadows, bit1 = VL noise, bit2 = blue-noise dither, bit3 = temporal dither rotation, bit4 = VL cluster culling, bit5 = VL shadow Hi-Z segment skip, bit6 = depth-aware bilateral upsample, bit7 = GLOBALS VALID, bit8 = outline, bit9 = outline front, bit10 = outline glow, bits11-12 = outline target)
  *       vec4 irlite_vlD;   // x = noiseMorph (0 = morph off), y = bilateral depth sigma in blocks (0 = shader default), z/w = reserved1/2 (written as 0)
+ *       vec4 irlite_vlE;   // outline: x = strength, y = fresnelPower, z = back, w = frontStrength
+ *       vec4 irlite_vlF;   // outline: x = glowStrength, y = pixelSize (int-valued), z/w = reserved (written as 0)
  *   };
+ *
+ * Growing the block in the TAIL is binary-safe: std140 offsets 0..63 do not move,
+ * so a pack built against the 4-vec4 version keeps reading the same bytes out of
+ * the larger buffer. Never reorder existing fields or bits 0..6.
  */
 public final class VlGlobalsBuffer
 {
     public static final int BINDING = 7;
 
-    private static final int CAPACITY = 64;     // 4 × vec4 (std140)
+    private static final int CAPACITY = 96;     // 6 × vec4 (std140)
+
+    /** vlC.w bit7. Set on every upload (never via a setter, so it cannot be
+     *  forgotten): it tells the shader the whole block carries real data. An
+     *  unbound UBO reads as zeros, so the bit is false and every knob falls back
+     *  to its compile-time define. A zero sentinel cannot serve here — 0 is a
+     *  legal user value for most of the outline scalars. */
+    private static final int FLAG_GLOBALS_VALID = 1 << 7;
 
     private static int ubo = 0;
     private static ByteBuffer scratch = null;
@@ -44,6 +57,20 @@ public final class VlGlobalsBuffer
     private static int shadowStride = 2;        // IRLITE_VL_SHADOW_STRIDE 2
     private static int noiseStride = 2;         // IRLITE_VL_NOISE_STRIDE 2
     private static int flags = 0x7F;            // bit0 = VL shadows, bit1 = VL noise, bit2 = blue-noise dither (default on), bit3 = temporal dither rotation (default on), bit4 = VL cluster culling (default on), bit5 = VL shadow Hi-Z segment skip (default on), bit6 = depth-aware bilateral upsample (default on)
+
+    // Outline block (wave 1). Defaults mirror the pack's compile-time defines so
+    // behaviour is unchanged until a mod pushes its config. Held in their OWN
+    // flags word rather than folded into `flags` above: setVlGlobals callers
+    // rebuild `flags` from the VL toggles alone (the dev sweep in particular),
+    // and merging the two would let a partial VL push silently clear the outline
+    // state. upload() ORs them together instead.
+    private static float outlineStrength = 0.65F;      // IRLITE_OUTLINE_STRENGTH 0.65
+    private static float outlineFresnelPower = 2.2F;   // IRLITE_OUTLINE_FRESNEL_POWER 2.2
+    private static float outlineBack = 1F;             // IRLITE_OUTLINE_BACK 1.0
+    private static float outlineFrontStrength = 0.3F;  // IRLITE_OUTLINE_FRONT_STRENGTH 0.3
+    private static float outlineGlowStrength = 0.12F;  // IRLITE_OUTLINE_GLOW_STRENGTH 0.12
+    private static float outlinePixelSize = 6F;        // IRLITE_OUTLINE_PIXEL_SIZE 6
+    private static int outlineFlags = (1 << 8) | (1 << 11);   // outline on, front off, glow off, target 1 (entities)
 
     /** Frame counter for the temporal dither rotation (flags bit3): written to
      *  irlite_vlB.w each upload, wrapped to 12 bits so the float stays exact.
@@ -97,6 +124,25 @@ public final class VlGlobalsBuffer
         VlGlobalsBuffer.flags = flags;
     }
 
+    /** Pushes the outline knob set for the next upload. Separate from set() on
+     *  purpose — see the outlineFlags comment above. target is 0 all / 1 entities
+     *  / 2 blocks; pixelSize is the depth-edge tap offset in pixels. */
+    public static void setOutline(boolean enabled, int target, float strength, float fresnelPower,
+                                  float back, boolean front, float frontStrength,
+                                  boolean glow, float glowStrength, int pixelSize)
+    {
+        VlGlobalsBuffer.outlineStrength = strength;
+        VlGlobalsBuffer.outlineFresnelPower = Math.max(1e-3F, fresnelPower);   // pow() exponent
+        VlGlobalsBuffer.outlineBack = back;
+        VlGlobalsBuffer.outlineFrontStrength = frontStrength;
+        VlGlobalsBuffer.outlineGlowStrength = glowStrength;
+        VlGlobalsBuffer.outlinePixelSize = Math.max(1, Math.min(6, pixelSize));
+        VlGlobalsBuffer.outlineFlags = (enabled ? 1 << 8 : 0)
+            | (front ? 1 << 9 : 0)
+            | (glow ? 1 << 10 : 0)
+            | ((Math.max(0, Math.min(2, target)) & 3) << 11);
+    }
+
     public static void upload()
     {
         if (!initialized)
@@ -107,8 +153,10 @@ public final class VlGlobalsBuffer
         scratch.clear();
         scratch.putFloat(intensity).putFloat(maxDist).putFloat(tipBoost).putFloat(tipRadius);
         scratch.putFloat(noiseAmount).putFloat(noiseScale).putFloat(noiseSpeed).putFloat(frameIndex);  // w = frameIndex
-        scratch.putInt(stepMax).putInt(shadowStride).putInt(noiseStride).putInt(flags);
+        scratch.putInt(stepMax).putInt(shadowStride).putInt(noiseStride).putInt(flags | outlineFlags | FLAG_GLOBALS_VALID);
         scratch.putFloat(noiseMorph).putFloat(0F).putFloat(0F).putFloat(0F);  // vlD: x = noiseMorph, y = bilateral sigma (0 = shader default, no setter yet), z/w reserved
+        scratch.putFloat(outlineStrength).putFloat(outlineFresnelPower).putFloat(outlineBack).putFloat(outlineFrontStrength);  // vlE
+        scratch.putFloat(outlineGlowStrength).putFloat(outlinePixelSize).putFloat(0F).putFloat(0F);  // vlF: z/w reserved
         scratch.flip();
 
         frameIndex = (frameIndex + 1) & 4095;   // one tick per upload = per frame
