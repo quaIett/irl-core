@@ -91,7 +91,11 @@ public final class ClusterGridBuffer
     private static boolean initialized = false;
 
     // --- Runtime toggle ------------------------------------------------------
-    private static boolean enabled = true;
+    /** Always on: the grid produces an identical image and only ever makes the
+     *  shader's per-pixel light loop cheaper, so there is no user-facing knob.
+     *  {@code -Dirlite.noClustering=true} forces it off for an A/B measurement
+     *  (read once at class init — restart to change). */
+    private static boolean enabled = !Boolean.getBoolean("irlite.noClustering");
 
     // --- Per-frame snapshot (recorded during LightRegistry.flush) ------------
     // Camera-relative light position + radius for EVERY packed light (W2),
@@ -149,8 +153,9 @@ public final class ClusterGridBuffer
     /** Enable/disable clustering at runtime. Disabled: {@link #record} stores
      *  nothing, {@link #markSnapshotFresh} leaves no fresh snapshot, and the late
      *  hook writes an empty (flags=0) header so the shader falls back to the full
-     *  per-fragment loop. Plumbed by the addon from its "shader_light_clustering"
-     *  setting, per frame, exactly like the upload cap. */
+     *  per-fragment loop. No consumer calls this any more — clustering is always
+     *  on and the A/B path is -Dirlite.noClustering; kept as API for a host that
+     *  needs to gate the grid itself (e.g. an export/replay pipeline). */
     public static void setEnabled(boolean value)
     {
         enabled = value;
