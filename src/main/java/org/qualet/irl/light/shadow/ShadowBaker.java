@@ -422,10 +422,14 @@ public final class ShadowBaker
         {
             return;
         }
-        if (LightRegistry.getCount() == 0)
+        if (!ShadowEngine.config().shadowsEnabled() || LightRegistry.getCount() == 0)
         {
-            // No lights — forget tiles + dirty state and drain every cache so
-            // nothing lingers in VRAM/heap after walking away from all lamps.
+            // Shadows switched off, or no lights at all — forget tiles + dirty
+            // state and drain every cache so nothing lingers in VRAM/heap. The
+            // enable is what makes the mod's "shadows off" toggle actually save
+            // the bake cost (13.5-17.8 ms/frame + ~1.6 GB), not just skip the
+            // shader-side sampling. Re-enabling rebuilds from scratch next frame,
+            // exactly like walking back toward a lamp.
             resetTileState();
             liveIds.clear();
             BlockShadowCache.retainOnly(liveIds);

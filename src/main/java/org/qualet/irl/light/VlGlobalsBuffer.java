@@ -16,10 +16,10 @@ import java.nio.ByteBuffer;
  *   layout(std140, binding = BINDING) uniform IrliteVlGlobals {
  *       vec4 irlite_vlA;   // x = intensity, y = maxDist, z = tipBoost, w = tipRadius
  *       vec4 irlite_vlB;   // x = noiseAmount, y = noiseScale, z = noiseSpeed, w = frameIndex (wraps at 4096)
- *       uvec4 irlite_vlC;  // x = stepMax, y = shadowStride, z = noiseStride, w = flags (bit0 = VL shadows, bit1 = VL noise, bit2 = blue-noise dither, bit3 = temporal dither rotation, bit4 = VL cluster culling, bit5 = VL shadow Hi-Z segment skip, bit6 = depth-aware bilateral upsample, bit7 = GLOBALS VALID, bit8 = outline, bit9 = outline front, bit10 = outline glow, bits11-12 = outline target)
+ *       uvec4 irlite_vlC;  // x = stepMax, y = shadowStride, z = noiseStride, w = flags (bit0 = VL shadows, bit1 = VL noise, bit2 = blue-noise dither, bit3 = temporal dither rotation, bit4 = VL cluster culling, bit5 = VL shadow Hi-Z segment skip, bit6 = depth-aware bilateral upsample, bit7 = GLOBALS VALID, bit8 = outline, bit9 = outline front, bit10 = outline glow, bits11-12 = outline target, bit13 = surface/outline shadows DISABLED)
  *       vec4 irlite_vlD;   // x = noiseMorph (0 = morph off), y = bilateral depth sigma in blocks (0 = shader default), z/w = reserved1/2 (written as 0)
  *       vec4 irlite_vlE;   // outline: x = strength, y = fresnelPower, z = back, w = frontStrength
- *       vec4 irlite_vlF;   // outline: x = glowStrength, y = pixelSize (int-valued), z/w = reserved (written as 0)
+ *       vec4 irlite_vlF;   // x = outline glowStrength, y = outline pixelSize (int-valued), z = shadow light size, w = reserved (written as 0)
  *   };
  *
  * Growing the block in the TAIL is binary-safe: std140 offsets 0..63 do not move,
@@ -71,6 +71,17 @@ public final class VlGlobalsBuffer
     private static float outlineGlowStrength = 0.12F;  // IRLITE_OUTLINE_GLOW_STRENGTH 0.12
     private static float outlinePixelSize = 6F;        // IRLITE_OUTLINE_PIXEL_SIZE 6
     private static int outlineFlags = (1 << 8) | (1 << 11);   // outline on, front off, glow off, target 1 (entities)
+
+    // Shadow block (wave 3). Only the penumbra width and the enable are live —
+    // IRLITE_SHADOW_QUALITY/_BIAS/_NORMAL_OFFSET stay compile-time in the pack.
+    // Same separate-word rationale as outlineFlags: a partial VL push must not be
+    // able to clear them.
+    private static float shadowSize = 0.10F;           // IRLITE_SHADOW_SIZE 0.10
+    // bit13 means shadows DISABLED, so the default (enabled) is a zero bit. A core
+    // older than this field writes the whole word without it, i.e. 0, which the
+    // shader must read as "not disabled" — hence the inverted sense is the
+    // fail-safe one: absence of the bit keeps shadows on, never silently off.
+    private static int shadowFlags = 0;                // surface/outline shadows on
 
     /** Frame counter for the temporal dither rotation (flags bit3): written to
      *  irlite_vlB.w each upload, wrapped to 12 bits so the float stays exact.
@@ -143,6 +154,14 @@ public final class VlGlobalsBuffer
             | ((Math.max(0, Math.min(2, target)) & 3) << 11);
     }
 
+    /** Pushes the live shadow knobs. size is the light-source width driving the
+     *  PCSS penumbra; a per-light bulb size still overrides it where set. */
+    public static void setShadow(boolean enabled, float size)
+    {
+        VlGlobalsBuffer.shadowSize = Math.max(0F, size);
+        VlGlobalsBuffer.shadowFlags = enabled ? 0 : 1 << 13;   // bit13 = DISABLED (see field comment)
+    }
+
     public static void upload()
     {
         if (!initialized)
@@ -153,10 +172,10 @@ public final class VlGlobalsBuffer
         scratch.clear();
         scratch.putFloat(intensity).putFloat(maxDist).putFloat(tipBoost).putFloat(tipRadius);
         scratch.putFloat(noiseAmount).putFloat(noiseScale).putFloat(noiseSpeed).putFloat(frameIndex);  // w = frameIndex
-        scratch.putInt(stepMax).putInt(shadowStride).putInt(noiseStride).putInt(flags | outlineFlags | FLAG_GLOBALS_VALID);
+        scratch.putInt(stepMax).putInt(shadowStride).putInt(noiseStride).putInt(flags | outlineFlags | shadowFlags | FLAG_GLOBALS_VALID);
         scratch.putFloat(noiseMorph).putFloat(0F).putFloat(0F).putFloat(0F);  // vlD: x = noiseMorph, y = bilateral sigma (0 = shader default, no setter yet), z/w reserved
         scratch.putFloat(outlineStrength).putFloat(outlineFresnelPower).putFloat(outlineBack).putFloat(outlineFrontStrength);  // vlE
-        scratch.putFloat(outlineGlowStrength).putFloat(outlinePixelSize).putFloat(0F).putFloat(0F);  // vlF: z/w reserved
+        scratch.putFloat(outlineGlowStrength).putFloat(outlinePixelSize).putFloat(shadowSize).putFloat(0F);  // vlF: w reserved
         scratch.flip();
 
         frameIndex = (frameIndex + 1) & 4095;   // one tick per upload = per frame

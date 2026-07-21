@@ -65,6 +65,19 @@ public interface ShadowConfig
         return 1.0f;
     }
 
+    /** Master enable for the whole bake. When false, {@link ShadowBaker} skips the
+     *  depth render, the filter flushes, the pyramid builds and the tile/VRAM
+     *  allocation entirely, releasing what it held — so a mod's "shadows off"
+     *  toggle saves the bake cost, not merely the shader-side sampling. The mod is
+     *  expected to OR this with any other consumer of the maps (the addon also
+     *  drives volumetric beam shadows, which sample the same atlas), so shadows
+     *  stay baked while EITHER surface or volumetric shadows are on. OPTIONAL (a
+     *  {@code default}): mods that predate it keep compiling and always bake. */
+    default boolean shadowsEnabled()
+    {
+        return true;
+    }
+
     /**
      * Canonical fallback ({@code 1 / true / 4 / true / 24}) so a mod that never
      * installs a config still bakes instead of NPEing. {@link ShadowEngine} uses this
@@ -102,6 +115,7 @@ public interface ShadowConfig
         private BooleanSupplier shadowBlocks;
         private IntSupplier shadowBlockRadius;
         private DoubleSupplier shadowPoseReach;
+        private BooleanSupplier shadowsEnabled;
 
         private Builder()
         {}
@@ -144,6 +158,14 @@ public interface ShadowConfig
             return this;
         }
 
+        /** OPTIONAL: omitted = the interface default (always enabled), so shims
+         *  that predate the bake gate keep building and keep baking. */
+        public Builder shadowsEnabled(BooleanSupplier shadowsEnabled)
+        {
+            this.shadowsEnabled = shadowsEnabled;
+            return this;
+        }
+
         public ShadowConfig build()
         {
             IntSupplier quality = requireNonNull(shadowQuality, "shadowQuality");
@@ -152,6 +174,7 @@ public interface ShadowConfig
             BooleanSupplier blocks = requireNonNull(shadowBlocks, "shadowBlocks");
             IntSupplier blockRadius = requireNonNull(shadowBlockRadius, "shadowBlockRadius");
             DoubleSupplier poseReach = shadowPoseReach; // optional, may be null
+            BooleanSupplier enabled = shadowsEnabled;   // optional, may be null
             return new ShadowConfig()
             {
                 public int shadowQuality()     { return quality.getAsInt(); }
@@ -160,6 +183,7 @@ public interface ShadowConfig
                 public boolean shadowBlocks()  { return blocks.getAsBoolean(); }
                 public int shadowBlockRadius() { return blockRadius.getAsInt(); }
                 public float shadowPoseReach() { return poseReach == null ? 1.0f : (float) poseReach.getAsDouble(); }
+                public boolean shadowsEnabled() { return enabled == null || enabled.getAsBoolean(); }
             };
         }
 
