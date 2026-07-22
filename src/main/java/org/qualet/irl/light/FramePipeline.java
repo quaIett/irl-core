@@ -4,6 +4,7 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.render.Camera;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.util.math.Vec3d;
+import org.joml.Matrix4f;
 import org.qualet.irl.light.shadow.ShadowBaker;
 
 import java.util.function.BooleanSupplier;
@@ -79,6 +80,7 @@ public final class FramePipeline
             {
                 dormant = true;
                 LightBuffer.uploadEmpty();
+                ClusterGridBuffer.uploadEmpty();
                 ShadowBaker.onShadersDisabled();
                 onDormant.run();
             }
@@ -108,6 +110,12 @@ public final class FramePipeline
         Vec3d cameraForward = camera != null ? Vec3d.fromPolar(camera.getPitch(), camera.getYaw()) : null;
 
         source.collect(world, cameraPos, tickDelta);
+
+        // Rank this frame's lights by camera-distance priority BEFORE the bake, so
+        // the shadow baker hands out tiles / static-bake budget to the highest-
+        // priority lights first and the deferred flush caps the SSBO upload to that
+        // same order.
+        LightRegistry.prioritize(cameraPos.x, cameraPos.y, cameraPos.z);
 
         // Bake spotlight shadow depth maps BEFORE the SSBO upload (sets each
         // spot's shadow tile index) and before Iris activates (vanilla entity
@@ -151,5 +159,39 @@ public final class FramePipeline
         Camera camera = mc.gameRenderer.getCamera();
         Vec3d p = camera != null ? camera.getPos() : Vec3d.ZERO;
         LightRegistry.flush(p.x, p.y, p.z);
+    }
+
+    /**
+     * Rasterise this frame's light snapshot into the {@link ClusterGridBuffer} tile
+     * masks, invoked by the addon's cluster mixin right after Iris captures the
+     * gbuffer matrices. Those are the matrices fragments actually use — the modelview
+     * INCLUDES bobbing, and the light snapshot is camera-relative to the (bob-free)
+     * eye — so the masks must be built with the captured full modelview, not a
+     * hand-rolled rotation.
+     *
+     * <p>Guards, in order:</p>
+     * <ul>
+     *   <li>clustering disabled -&gt; {@link ClusterGridBuffer#uploadEmpty()} (itself
+     *       idempotent, so no per-frame re-upload) and return;</li>
+     *   <li>no snapshot recorded THIS frame (the hook fired a second time, or flush
+     *       never ran) -&gt; return, leaving the previously uploaded masks untouched
+     *       rather than rebuilding a consumed snapshot against new matrices;</li>
+     *   <li>otherwise rasterise + upload (buildAndUpload clears the fresh flag).</li>
+     * </ul>
+     */
+    public static void onGbufferMatricesCaptured(Matrix4f modelView, Matrix4f projection)
+    {
+        if (!ClusterGridBuffer.isEnabled())
+        {
+            ClusterGridBuffer.uploadEmpty();
+            return;
+        }
+
+        if (!ClusterGridBuffer.hasFreshSnapshot())
+        {
+            return;
+        }
+
+        ClusterGridBuffer.buildAndUpload(modelView, projection);
     }
 }

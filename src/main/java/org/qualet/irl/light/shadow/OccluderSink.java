@@ -3,13 +3,14 @@ package org.qualet.irl.light.shadow;
 import net.minecraft.util.math.Box;
 
 /**
- * Allocation-free writer for the orchestration's faceless fixed-32 occluder
+ * Allocation-free writer for the orchestration's faceless bounded occluder
  * Struct-of-Arrays (occ/occType/oStatic/ox/oy/oz/orad/ostatichash). A
  * {@link ShadowCasterSource#collect} impl calls one {@code emit*} method per
  * in-range caster; the shared implementation appends the args into the parallel
  * arrays with primitive args only — NO heap allocation, NO boxing, NO return
- * value. Over-cap casters (beyond {@code MAX_OCCLUDERS == 32}) are silently
- * dropped (a missing shadow, never corruption), so a source need not pre-count.
+ * value. Over-cap casters are reduced to the nearest bounded set by the sink,
+ * so a source need not pre-count. Non-finite centers/radii and negative radii
+ * are discarded as malformed input.
  *
  * <p>See {@code irl-core/docs/shadow-caster-seam-spec.md}. The blessed path is
  * {@link #emitFromBox}, which COMPUTES the cull-pinned bounding sphere from the

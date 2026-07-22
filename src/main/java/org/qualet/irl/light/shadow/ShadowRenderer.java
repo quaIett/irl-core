@@ -153,7 +153,7 @@ public final class ShadowRenderer
         GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, SpotlightDepthAtlas.getFboId(toStatic));
         int px = SpotlightDepthAtlas.tilePixelX(tile);
         int py = SpotlightDepthAtlas.tilePixelY(tile);
-        int ts = SpotlightDepthAtlas.TILE_SIZE;
+        int ts = SpotlightDepthAtlas.tileSizePx(tile);
         GL11.glViewport(px, py, ts, ts);
         GL11.glEnable(GL11.GL_SCISSOR_TEST);
         GL11.glScissor(px, py, ts, ts);
@@ -183,12 +183,46 @@ public final class ShadowRenderer
     }
 
     /**
-     * Begin a point-cube face depth pass into the live or static array (see
-     * {@link #beginSpot} for the {@code toStatic}/{@code clear} semantics; the
-     * static base of a whole cube is restored by
-     * {@link PointShadowArray#copyStaticToLive}).
+     * Narrow the current pass's scissor to a TILE-LOCAL depth-pixel rect
+     * (partial-tile overlay draw: only the dynamic casters' region may be
+     * written — the scissor is the HARD bound that keeps depth writes inside
+     * the region the filters will re-run on, so an under-estimated caster
+     * bbox degrades to visible silhouette clipping, never to stale
+     * pyramid/EVSM content being sampled as fresh). Call between
+     * {@link #beginSpot} (which set the full-tile scissor; the viewport — the
+     * NDC mapping — stays full-tile) and the caster draws; {@link #endPass}
+     * restores the caller's scissor as usual.
      */
-    public static void beginPointFace(int slot, int face,
+    public static void restrictScissorSpot(int tile, int localX, int localY, int w, int h)
+    {
+        int px = SpotlightDepthAtlas.tilePixelX(tile);
+        int py = SpotlightDepthAtlas.tilePixelY(tile);
+        GL11.glScissor(px + localX, py + localY, w, h);
+    }
+
+    /** DIAGNOSTIC (-Dirlite.dynRectDebug=true): clear the CURRENTLY SCISSORED
+     *  depth region to the near plane, making the partial-tile dyn rect show
+     *  up in the world as a fully-shadowed block of the spot's light — a
+     *  direct visual of where the rect actually lands relative to the caster
+     *  it is supposed to cover. Call right after {@link #restrictScissorSpot}. */
+    public static void debugFillScissoredDepth()
+    {
+        GL11.glClearDepth(0.0);
+        GL11.glClear(GL11.GL_DEPTH_BUFFER_BIT);
+        GL11.glClearDepth(1.0);
+    }
+
+    /**
+     * Begin a point-cube face depth pass into the live or static atlas (see
+     * {@link #beginSpot} for the {@code toStatic}/{@code clear} semantics; the
+     * static base of a whole block is restored by
+     * {@link PointDepthAtlas#copyStaticToLive}). {@code block} is the GLOBAL
+     * atlas block (the value published to vlParams.w); the face's pixel rect
+     * inside the flat atlas comes from the PointDepthAtlas accessors. The
+     * face switch below is the layout canon of
+     * {@link PointDepthAtlas#FACE_COL}/{@link PointDepthAtlas#FACE_ROW}.
+     */
+    public static void beginPointFace(int block, int face,
                                       double lpx, double lpy, double lpz,
                                       float radius,
                                       boolean toStatic, boolean clear)
@@ -203,11 +237,13 @@ public final class ShadowRenderer
         float ey = (float) (lpy - currentOriginY);
         float ez = (float) (lpz - currentOriginZ);
 
-        PointShadowArray.bindFaceForRender(slot, face, toStatic);
-        int fs = PointShadowArray.FACE_SIZE;
-        GL11.glViewport(0, 0, fs, fs);
+        GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, PointDepthAtlas.getFboId(toStatic));
+        int px = PointDepthAtlas.facePixelX(block, face);
+        int py = PointDepthAtlas.facePixelY(block, face);
+        int ts = PointDepthAtlas.faceSizePx(block);
+        GL11.glViewport(px, py, ts, ts);
         GL11.glEnable(GL11.GL_SCISSOR_TEST);
-        GL11.glScissor(0, 0, fs, fs);
+        GL11.glScissor(px, py, ts, ts);
         if (clear)
         {
             GL11.glClearDepth(1.0);
@@ -915,7 +951,7 @@ public final class ShadowRenderer
         // The saved state is the original MC/Iris GL state, which every endPass
         // restores — so it is invariant across all passes of one bake. Snapshot
         // it only on the first pass (the glGet* are CPU<->GPU sync points; up to
-        // 16 spots + 16*6 point faces = ~112 passes would otherwise issue ~5
+        // 64 spots + 18*6 point faces = ~172 passes would otherwise issue ~5
         // each). beginBake() re-arms it for the next bake.
         inPass = true;
         if (passStateSaved)

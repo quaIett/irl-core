@@ -41,7 +41,7 @@
 ```
 shared (orchestration, MC-typed)                         ← stays identical across all variants
   ├─ spot-atlas / point-cube-array layout (SpotlightDepthAtlas, PointShadowArray — already separate)
-  ├─ collect() called ONCE per bake → fills fixed-32 SoA via OccluderSink
+  ├─ collect() called ONCE per bake → fills bounded nearest-128 SoA via OccluderSink
   ├─ cull (range / insideCone / sphereTouchesFace), T1.1 shortlist, sticky tiles
   ├─ 2-layer bake (static base → GPU copy → dynamic overlay), dirty caches, all 6 T-opts
   ├─ per-pass: begin*() → [ emitOccluder × N ] → flush (once, success path) → endPass()
@@ -63,7 +63,7 @@ never touches `occ[]`. It is therefore a shared helper, **NOT** part of the BBS 
 
 ## The shared occluder model (must be preserved)
 
-Orchestration holds casters as a faceless Struct-of-Arrays, `MAX_OCCLUDERS = 32`,
+Orchestration holds casters as a faceless Struct-of-Arrays, `MAX_OCCLUDERS = 128`,
 **fixed arrays, deliberately no per-frame allocation**:
 
 | field | type | meaning |

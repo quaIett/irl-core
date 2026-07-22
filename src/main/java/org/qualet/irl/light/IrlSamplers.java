@@ -8,7 +8,7 @@ import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL30;
 import org.lwjgl.opengl.GL40;
 
-import org.qualet.irl.light.shadow.PointShadowArray;
+import org.qualet.irl.light.shadow.PointDepthAtlas;
 import org.qualet.irl.light.shadow.PointShadowEvsm;
 import org.qualet.irl.light.shadow.PointShadowPyramid;
 import org.qualet.irl.light.shadow.SpotShadowEvsm;
@@ -61,15 +61,33 @@ public final class IrlSamplers
     {
         // Core-owned shadow textures. Order + names + targets mirror the GLSL contract.
         register("irl_spotShadowAtlas", SpotlightDepthAtlas::getGlTextureId, GL11.GL_TEXTURE_2D);
-        register("irl_pointShadowArray", PointShadowArray::getGlTextureId, GL40.GL_TEXTURE_CUBE_MAP_ARRAY);
+        // Point depth is a flat 2D atlas like the spot one (atlas-merge series);
+        // no cube-array rebind — plain 2D, sampled with the manual face-select UV.
+        register("irl_pointShadowAtlas", PointDepthAtlas::getGlTextureId, GL11.GL_TEXTURE_2D);
         // F1a: min/max mip pyramid of the spot atlas (plain 2D, no target rebind needed).
         register("irl_spotShadowPyramid", SpotShadowPyramid::getGlTextureId, GL11.GL_TEXTURE_2D);
         // F1b: face-major point pyramid — a 2D array, rebound to GL_TEXTURE_2D_ARRAY.
-        register("irl_pointShadowPyramid", PointShadowPyramid::getGlTextureId, GL30.GL_TEXTURE_2D_ARRAY);
+        // The filters keep PER-TIER storage (layer = LOCAL block * 6 + face).
+        register("irl_pointShadowPyramid", () -> PointShadowPyramid.getGlTextureId(0), GL30.GL_TEXTURE_2D_ARRAY);
         // F2a: EVSM prefilter of the spot atlas (plain 2D + mips, no target rebind needed).
         register("irl_spotEvsm", SpotShadowEvsm::getGlTextureId, GL11.GL_TEXTURE_2D);
         // F2b: point MSM sampled through a CUBE_MAP_ARRAY view (hardware-seamless face edges).
-        register("irl_pointEvsm", PointShadowEvsm::getGlTextureId, GL40.GL_TEXTURE_CUBE_MAP_ARRAY);
+        register("irl_pointEvsm", () -> PointShadowEvsm.getGlTextureId(0), GL40.GL_TEXTURE_CUBE_MAP_ARRAY);
+        // I3 LOD tiers: the tier-1/2 point FILTER texture sets, appended AFTER
+        // the six legacy entries — this order is the FROZEN contract for the
+        // phase-I4 GLSL. Tier-0 names stay unsuffixed. Iris binds by NAME;
+        // registration order only shifts texture-unit numbers, which no consumer
+        // depends on (the per-mod cookie array still registers later, at mod
+        // init). The tier-1/2 DEPTH entries (irl_pointShadowArray1/2) are GONE —
+        // the atlas-merge series folded all point depth into the single
+        // irl_pointShadowAtlas above.
+        register("irl_pointShadowPyramid1", () -> PointShadowPyramid.getGlTextureId(1), GL30.GL_TEXTURE_2D_ARRAY);
+        register("irl_pointEvsm1", () -> PointShadowEvsm.getGlTextureId(1), GL40.GL_TEXTURE_CUBE_MAP_ARRAY);
+        register("irl_pointShadowPyramid2", () -> PointShadowPyramid.getGlTextureId(2), GL30.GL_TEXTURE_2D_ARRAY);
+        register("irl_pointEvsm2", () -> PointShadowEvsm.getGlTextureId(2), GL40.GL_TEXTURE_CUBE_MAP_ARRAY);
+        // VL CP2: bundled 128x128 R8 spatial blue noise for the VL march-start
+        // dither (VlGlobalsBuffer flags bit2). Plain 2D, no target rebind.
+        register("irl_blueNoise", BlueNoiseTexture::getId, GL11.GL_TEXTURE_2D);
     }
 
     private IrlSamplers()
