@@ -100,13 +100,13 @@ All `mchorse.bbs_mod.*` (Map D externalDependencies), the two existing accessors
 
 ### `collect(ClientWorld world, Vec3d camPos, float tickDelta, OccluderSink sink)` — 3 arms, in this order
 
-> **Arm call order is load-bearing** (Map D risk "OVER-CAP DROP ORDERING"): entity → model-block → replay, so under MAX_OCCLUDERS=32 pressure the priority is deterministic and matches the old single-cursor behavior. Keep this order.
+> **Historical note (pre-OPEN-2):** arm order originally controlled over-cap drops. The live sink now retains the nearest 128 casters; traversal order only resolves exact equal-distance ties deterministically.
 
 **Arm 1 — ENTITY** (from old `collect()` Baker:1068-1114):
 - Walk `world.getEntities()`, keep `LivingEntity || ItemEntity` within `COLLECT_DIST`.
 - Per entity, lerp `ex/ey/ez` (`lastRenderX/Y/Z`→`getX/Y/Z`), then **one call**:
   `sink.emitFromBox(entity, CasterType.ENTITY, false, ex, ey, ez, entity.getBoundingBox(), 1f, 0L)`.
-- **DELETE** `occCount=0` (sink owns cursor), the `MAX_OCCLUDERS` break (sink drops over-cap), and the old local `max-edge*0.5` radius math at Baker:1097 (**INV-5 fix** — emitFromBox derives the diagonal). `isStatic=false`, `staticHash=0L` (entities always dynamic, **INV-2**). This arm is line-for-line `RedactorEntityCasterSource.collect` (Map D rawNotes).
+- **DELETE** `occCount=0` (sink owns cursor), the `MAX_OCCLUDERS` break (sink retains the bounded nearest set), and the old local `max-edge*0.5` radius math at Baker:1097 (**INV-5 fix** — emitFromBox derives the diagonal). `isStatic=false`, `staticHash=0L` (entities always dynamic, **INV-2**). This arm is line-for-line `RedactorEntityCasterSource.collect` (Map D rawNotes).
 
 **Arm 2 — MODEL_BLOCK** (from old `collectModelBlocks` Baker:1235-1321 + `modelBlockHash` 1326-1339):
 - All BBS try/catch STAYS INSIDE this method (**INV-4 scoping**, spec 112-113).
@@ -230,7 +230,7 @@ If any fails: the orchestration is shared/correct on canon, so the suspect is al
 
 5. **[Q5 — INV-4 impl must drop its own try/catch]** IRLite's old `renderCaster` swallowed throws (L208-232). The migrated `emitOccluder` MUST let throws propagate to the shared `emitCaster` wrapper, else run-isolation is silently defeated (Map D risk INV-4; spec 300-306). This is a discipline risk during the §3 port, not a design decision — call it out in review.
 
-6. **[Q6 — over-cap arm order]** The 3 collect arms share MAX_OCCLUDERS=32 via one cursor; keep call order entity→model-block→replay so over-cap drops match the old priority (Map D risk "OVER-CAP DROP ORDERING"). No decision, just a guardrail for the implementer.
+6. **[Q6 — resolved by OPEN-2]** The 3 collect arms share a bounded nearest-128 sink. Keep entity→model-block→replay for deterministic exact-distance ties; arm order no longer decides ordinary over-cap retention.
 
 ---
 

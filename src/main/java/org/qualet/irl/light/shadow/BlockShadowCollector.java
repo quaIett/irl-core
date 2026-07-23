@@ -2,11 +2,14 @@ package org.qualet.irl.light.shadow;
 
 import net.minecraft.block.BlockRenderType;
 import net.minecraft.block.BlockState;
+import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.render.RenderLayer;
+import net.minecraft.client.render.block.BlockModels;
 import net.minecraft.client.render.RenderLayers;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.shape.VoxelShape;
+import net.minecraft.world.BlockView;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -142,5 +145,108 @@ public final class BlockShadowCollector
         }
 
         return out;
+    }
+
+    /** How a state would enter a bake, mirroring collectForLight's decisions:
+     *  NONE never emits geometry, CUTOUT bakes its textured BakedModel, SHAPE
+     *  bakes its resolved VoxelShape. */
+    private static final int KIND_NONE = 0;
+    private static final int KIND_CUTOUT = 1;
+    private static final int KIND_SHAPE = 2;
+
+    /**
+     * True when swapping {@code oldState} for {@code newState} at {@code pos}
+     * provably leaves every lamp's baked silhouette unchanged, so the block
+     * cache does NOT need to invalidate. Used by
+     * {@link BlockShadowCache#invalidateChange} to ignore state churn that a
+     * depth map can't see: grass->dirt, a furnace lighting up, fluid level
+     * ticks (fluids are INVISIBLE render type), leaves' distance updates.
+     *
+     * The classification here must stay in lockstep with collectForLight
+     * above; any new keep/skip rule there needs a matching input here. On any
+     * doubt (cutout models that differ, resolution throwing) this returns
+     * false — a wasted rebake is cheap, a stale shadow is a visible bug.
+     */
+    public static boolean sameSilhouette(BlockView world, BlockPos pos,
+                                         BlockState oldState, BlockState newState)
+    {
+        try
+        {
+            VoxelShape[] shapeOut = new VoxelShape[2];
+            int oldKind = casterKind(world, pos, oldState, shapeOut, 0);
+            int newKind = casterKind(world, pos, newState, shapeOut, 1);
+            if (oldKind == KIND_NONE && newKind == KIND_NONE)
+            {
+                return true;
+            }
+            if (oldKind != newKind)
+            {
+                return false;
+            }
+            // The host-cell emitter skip keys on luminance>0: a lamp living
+            // inside this block drops it from its caster list only while it
+            // emits, so a luminance flip (redstone lamp) changes that lamp's
+            // list even with an identical shape. We can't see host cells from
+            // here, so treat any flip as a real change.
+            if ((oldState.getLuminance() > 0) != (newState.getLuminance() > 0))
+            {
+                return false;
+            }
+            if (oldKind == KIND_CUTOUT)
+            {
+                // Cutout geometry is the baked model. States sharing one baked
+                // model instance (leaves distance=1 vs 2, fire ages) render
+                // identically; distinct instances may differ — assume they do.
+                BlockModels models = MinecraftClient.getInstance().getBakedModelManager().getBlockModels();
+                return models.getModel(oldState) == models.getModel(newState);
+            }
+            VoxelShape a = shapeOut[0], b = shapeOut[1];
+            // Most blocks serve shapes from per-state static caches (full cubes
+            // are one singleton), so identity catches the common case; fall
+            // back to comparing the AABB decomposition the bake actually draws.
+            return a == b || a.getBoundingBoxes().equals(b.getBoundingBoxes());
+        }
+        catch (Throwable t)
+        {
+            return false;
+        }
+    }
+
+    /** Classify one state the way collectForLight would treat it; for
+     *  KIND_SHAPE the resolved shape is left in {@code shapeOut[slot]}. */
+    private static int casterKind(BlockView world, BlockPos pos, BlockState state,
+                                  VoxelShape[] shapeOut, int slot)
+    {
+        if (state.isAir() || state.getRenderType() == BlockRenderType.INVISIBLE)
+        {
+            return KIND_NONE;
+        }
+        try
+        {
+            RenderLayer layer = RenderLayers.getBlockLayer(state);
+            if (layer == RenderLayer.getCutout() || layer == RenderLayer.getCutoutMipped())
+            {
+                return KIND_CUTOUT;
+            }
+        }
+        catch (Throwable t)
+        {
+            // collectForLight treats a throwing layer lookup as non-cutout too
+        }
+        VoxelShape shape = state.getCullingShape();
+        if (shape == null || shape.isEmpty())
+        {
+            shape = state.getCollisionShape(world, pos);
+        }
+        if (shape == null || shape.isEmpty())
+        {
+            shape = state.getOutlineShape(world, pos);
+        }
+        if (shape == null || shape.isEmpty())
+        {
+            return KIND_NONE;
+        }
+        shapeOut[slot] = shape;
+        return KIND_SHAPE;
     }
 }

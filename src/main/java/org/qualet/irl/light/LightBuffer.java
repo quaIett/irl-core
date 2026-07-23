@@ -17,13 +17,15 @@ import java.nio.ByteBuffer;
  *       vec4 colorIntensity;  // rgb = linear color, a = intensity
  *       vec4 dirType;         // xyz = direction (spot, normalized), w = type (0 point, 1 spot)
  *       vec4 cone;            // x = cos(outerAngle/2), y = cos(innerAngle/2), z = lightMask (0 all, 1 entities only, 2 blocks only), w = bulbSize (0 = use global)
- *       vec4 vlParams;        // x = anisotropy (HG g), y = vlDensity, z = beamStrength, w = shadowTile (-1 = none)
+ *       vec4 vlParams;        // x = anisotropy (HG g), y = vlDensity, z = beamStrength, w = shadowTile (-1 = none; spot: atlas tile, point: PointDepthAtlas block)
  *       vec4 cookie;          // x = gobo layer (-1 = none), y = rotation (rad), z = scale, w = flags (bit0 = invert) — spot-only projected mask
  *   };
  *
  *   layout(std430, binding = BINDING) buffer IrliteLights {
  *       uint irlite_lightCount;
- *       uint _pad0, _pad1, _pad2;
+ *       float irlite_vlIntensityRt;
+ *       uint irlite_vlFlagsRt;      // bit0 = VL shadows enabled, bit1 = VL noise enabled
+ *       uint _pad2;
  *       Light irlite_lights[];
  *   };
  */
@@ -38,7 +40,7 @@ public final class LightBuffer
     // needs regenerating for a larger ceiling. SSBO size = 16 + 2048*80 ≈ 164 KB.
     public static final int MAX_LIGHTS = 2048;
 
-    private static final int HEADER_BYTES = 16;     // uint count + 12 B pad (std430 vec4 align)
+    private static final int HEADER_BYTES = 16;     // uint count + float vlIntensity + uint vlFlags + 4 B pad (std430 vec4 align)
     private static final int LIGHT_BYTES = 96;      // 6 × vec4
     private static final int CAPACITY = HEADER_BYTES + MAX_LIGHTS * LIGHT_BYTES;
 
@@ -46,6 +48,8 @@ public final class LightBuffer
     private static ByteBuffer scratch = null;
     private static boolean initialized = false;
     private static int count = 0;
+    private static float vlGlobalIntensity = 1F;
+    private static int vlFlags = 0x3;
 
     private LightBuffer()
     {}
@@ -113,6 +117,23 @@ public final class LightBuffer
         count++;
     }
 
+    /** Global VL intensity multiplier written into the SSBO header at offset 4
+     *  on every upload. Clamped to &gt;= 1e-6 so a stored exact 0.0 can only mean
+     *  the header was never written, letting the shader fall back to its
+     *  compile-time default. */
+    public static void setVlGlobalIntensity(float v)
+    {
+        vlGlobalIntensity = v >= 1e-6F ? v : 1e-6F;
+    }
+
+    /** Runtime VL feature flags written into the SSBO header at offset 8 on
+     *  every upload: bit0 = VL shadows enabled, bit1 = VL noise enabled.
+     *  Defaults to all-on so shaders behave normally before the first push. */
+    public static void setVlFlags(int flags)
+    {
+        vlFlags = flags;
+    }
+
     public static void upload()
     {
         if (!initialized)
@@ -121,6 +142,8 @@ public final class LightBuffer
         }
 
         scratch.putInt(0, count);
+        scratch.putFloat(4, vlGlobalIntensity);
+        scratch.putInt(8, vlFlags);
 
         int used = scratch.position();
         scratch.position(0);
@@ -132,6 +155,8 @@ public final class LightBuffer
         GL15.glBindBuffer(GL43.GL_SHADER_STORAGE_BUFFER, 0);
 
         scratch.clear();
+
+        VlGlobalsBuffer.upload();
     }
 
     /** Zero the GPU-side light count so a pipeline (re)enabled later can't
@@ -163,5 +188,7 @@ public final class LightBuffer
         }
 
         initialized = false;
+
+        VlGlobalsBuffer.delete();
     }
 }

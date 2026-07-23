@@ -76,6 +76,7 @@ public abstract class CookieArrayBase
 
             ByteBuffer resized = MemoryUtil.memAlloc(RES * RES);
             STBImageResize.stbir_resize_uint8(img, w.get(0), h.get(0), 0, resized, RES, RES, 0, 1);
+            flipHorizontal(resized);   // see flipHorizontal: cancels the left-handed X of the spot projection so the gobo isn't mirrored
             return resized;
         }
         finally
@@ -85,6 +86,31 @@ public abstract class CookieArrayBase
                 STBImage.stbi_image_free(img);
             }
             MemoryUtil.memFree(rawBuf);
+        }
+    }
+
+    /** Mirror a RES*RES single-channel buffer left-to-right, in place.
+     *
+     *  <p>The spot cookie projection ({@code irlite_cookie} in {@code irlite_lights.glsl})
+     *  builds a left-handed frustum basis ({@code s = cross(ld, up)}, {@code u = cross(s, ld)}
+     *  give {@code s x u = -ld}), so the projected X is mirrored and a raw gobo would land
+     *  flipped versus its source image. We correct it once on the stored texture — every pack
+     *  and both mods sample the same {@code irl_cookieArray} — instead of negating the
+     *  projected X in each pack's GLSL. Absolute get/put only, so the buffer's position/limit
+     *  stay put for {@link #uploadLayer}.</p> */
+    private static void flipHorizontal(ByteBuffer buf)
+    {
+        for (int y = 0; y < RES; y++)
+        {
+            int row = y * RES;
+            for (int xl = 0, xr = RES - 1; xl < xr; xl++, xr--)
+            {
+                int l = row + xl;
+                int r = row + xr;
+                byte t = buf.get(l);
+                buf.put(l, buf.get(r));
+                buf.put(r, t);
+            }
         }
     }
 
