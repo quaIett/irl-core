@@ -7,73 +7,79 @@ import org.lwjgl.opengl.GL13;
 import org.lwjgl.opengl.GL15;
 import org.lwjgl.opengl.GL20;
 import org.lwjgl.opengl.GL30;
-import org.lwjgl.opengl.GL40;
 import org.lwjgl.opengl.GL42;
 import org.lwjgl.opengl.GL43;
 
 /**
- * Min/max mip pyramid over the LIVE point shadow cube-array (F1b). Stored as a
- * plain GL_TEXTURE_2D_ARRAY, face-major (layer = slot*6 + face), RG32F, base
- * level = face/2, mip chain down to one texel per face. The inject samples it
- * as {@code irl_pointShadowPyramid} (registered as 2D in Iris, rebound to
- * 2D_ARRAY by the host mod's SamplerBinding mixin, like the cookie array) for
- * a 4-texelFetch conservative classification before PCSS; taps whose footprint
- * crosses a cube-face border skip the early-out entirely (occluders on the
- * adjacent face are invisible to a face-local pyramid — the full PCSS path
- * handles the seam via real cube sampling).
+ * Min/max mip pyramid over the LIVE point shadow atlas (F1b). Flat static like
+ * {@link SpotShadowPyramid}, but the storage stays PER-TIER: one
+ * GL_TEXTURE_2D_ARRAY per {@link PointDepthAtlas} tier (three GLSL sampler
+ * sets, irl_pointShadowPyramid/1/2), face-major within the tier
+ * (layer = localBlock*6 + face), RG32F, base level = face/2, mip chain down to
+ * one texel per face. The inject samples it (registered as 2D in Iris, rebound
+ * to 2D_ARRAY by the host mod's SamplerBinding mixin, like the cookie array)
+ * for a 4-texelFetch conservative classification before PCSS; taps whose
+ * footprint crosses a cube-face border skip the early-out entirely (occluders
+ * on the adjacent face are invisible to a face-local pyramid — the full PCSS
+ * path handles the seam via per-tap face re-select).
  *
- * Same batched contract as {@link SpotShadowPyramid}: ShadowBaker marks slots
- * dirty after every write to their live faces and calls {@link #flushDirty()}
- * once after the point loop — one GL-state snapshot per batch, one barrier per
- * mip level. Pass 0 reads the depth cube through a samplerCubeArray at texel
- * centers (bilinear weights collapse to the exact texel there), reconstructing
- * the direction from (face, uv) with the inverse of the GL face-selection
- * table; deeper levels texelFetch the pyramid itself with an explicit lod.
+ * Same batched contract as {@link SpotShadowPyramid}: ShadowBaker marks blocks
+ * dirty (GLOBAL block index, one bit per block — all 6 faces always dirty
+ * together) after every write to their live faces and calls
+ * {@link #flushDirty()} once after the point loop — one GL-state snapshot per
+ * batch, one barrier per mip level per tier. Pass 0 texelFetches the depth
+ * atlas directly: the block's 3x2 face rect is resolved from the blockOrigin
+ * uniform + the compile-time FACE_OFF table (the atlas mirror of
+ * PointDepthAtlas.FACE_COL/FACE_ROW); deeper levels texelFetch the pyramid
+ * itself with an explicit lod.
  *
- * Cube-array / 2D-array texture bindings are NOT tracked by GlStateManager
- * (its cache is 2D-only), so raw glBindTexture + glGet-restore is used for
- * those targets; everything else mirrors SpotShadowPyramid.
+ * 2D-array texture bindings are NOT tracked by GlStateManager (its cache is
+ * 2D-only), so raw glBindTexture + glGet-restore is used for that target;
+ * everything else mirrors SpotShadowPyramid.
  */
 public final class PointShadowPyramid
 {
-    private static int texId = 0;
-    private static int levels = 0;
-    private static int progCube = 0;   // pass 0: depth cube -> pyramid lod 0
+    private static final int[] texId = new int[3];   // one 2D-array per tier
+    private static final int[] levels = new int[3];
+    /** Blocks each tier's array physically backs (layers = blocks*6). Grown
+     *  in {@link ShadowVramBudget}-approved chunks by {@link #flushDirty};
+     *  0 until the tier's first dirty block. */
+    private static final int[] capBlocks = new int[3];
+    /** One bit per GLOBAL block (1L << block); long because the atlas layout
+     *  allows up to 64 blocks (guarded in PointDepthAtlas). */
+    private static long dirtyMask = 0L;
+
+    // Compute programs + uniform locations — the GLSL sources are
+    // size-independent, every size flows through uniforms.
+    private static int progCube = 0;   // pass 0: depth atlas -> pyramid lod 0
     private static int progMip = 0;    // lod L-1 -> lod L
-    private static int uCubeSrc, uCubeSlot, uCubeDstSize;
+    private static int uCubeSrc, uCubeSlot, uCubeDstSize, uCubeBlockOrigin;
     private static int uMipSrc, uMipSrcLod, uMipLayerBase, uMipDstSize;
     private static boolean programsAttempted = false;
-    private static int dirtyMask = 0;
 
     private static final String CUBE_SRC =
         "#version 430 core\n" +
         "layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;\n" +
         "layout(rg32f, binding = 0) uniform writeonly image2DArray dstMip;\n" +
-        "uniform samplerCubeArray srcCube;\n" +
-        "uniform int slot;\n" +
+        "uniform sampler2D srcAtlas;\n" +
+        "uniform int slot;\n" +                      // LOCAL block index inside the tier (dst layer base / 6)
         "uniform ivec2 dstSize;\n" +
-        "vec3 faceDir(int face, vec2 st)\n" +      // inverse of the GL cube face-selection table
-        "{\n" +
-        "    if (face == 0) return vec3( 1.0, -st.y, -st.x);\n" +
-        "    if (face == 1) return vec3(-1.0, -st.y,  st.x);\n" +
-        "    if (face == 2) return vec3( st.x,  1.0,  st.y);\n" +
-        "    if (face == 3) return vec3( st.x, -1.0, -st.y);\n" +
-        "    if (face == 4) return vec3( st.x, -st.y,  1.0);\n" +
-        "    return vec3(-st.x, -st.y, -1.0);\n" +
-        "}\n" +
+        "uniform ivec2 blockOrigin;\n" +             // pixel origin of the block (its col-0/row-0 face corner)
+        "const ivec2 FACE_OFF[6] = ivec2[6](ivec2(0,0), ivec2(1,0), ivec2(2,0),\n" +
+        "                                   ivec2(0,1), ivec2(1,1), ivec2(2,1));\n" +
         "void main()\n" +
         "{\n" +
         "    ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n" +
         "    if (g.x >= dstSize.x || g.y >= dstSize.y) return;\n" +
         "    int face = int(gl_GlobalInvocationID.z);\n" +
-        "    float srcRes = float(dstSize.x * 2);\n" +
+        "    int srcRes = dstSize.x * 2;\n" +
+        "    ivec2 faceBase = blockOrigin + FACE_OFF[face] * srcRes;\n" +
         "    float mn = 1.0;\n" +
         "    float mx = 0.0;\n" +
         "    for (int j = 0; j < 2; j++)\n" +
         "    for (int i = 0; i < 2; i++)\n" +
         "    {\n" +
-        "        vec2 uv = (vec2(g * 2 + ivec2(i, j)) + 0.5) / srcRes;\n" +   // texel centers: bilinear collapses to the exact texel
-        "        float d = textureLod(srcCube, vec4(faceDir(face, uv * 2.0 - 1.0), float(slot)), 0.0).r;\n" +
+        "        float d = texelFetch(srcAtlas, faceBase + g * 2 + ivec2(i, j), 0).r;\n" +
         "        mn = min(mn, d);\n" +
         "        mx = max(mx, d);\n" +
         "    }\n" +
@@ -108,46 +114,68 @@ public final class PointShadowPyramid
 
     /** Lazy — 0 until the first flush; bound by name via the host mod's sampler
      *  mixins (registered 2D, rebound to GL_TEXTURE_2D_ARRAY). */
-    public static int getGlTextureId()
+    public static int getGlTextureId(int tier)
     {
-        return texId;
+        return texId[tier];
     }
 
-    /** Mark one slot's 6 pyramid faces stale. Call after every bake/copy that
-     *  changed any of the slot's live faces. */
-    public static void markDirty(int slot)
+    /** Mark one GLOBAL block's 6 pyramid faces stale. Call after every
+     *  bake/copy that changed any of the block's live faces. */
+    public static void markDirty(int block)
     {
-        if (slot >= 0 && slot < PointShadowArray.MAX_SHADOWS)
+        if (block >= 0 && block < PointDepthAtlas.blockCount())
         {
-            dirtyMask |= 1 << slot;
+            dirtyMask |= 1L << block;
         }
     }
 
-    /** Rebuild every dirty slot's pyramid (all 6 faces) in one batch. Call once
+    public static boolean isDirty(int block)
+    {
+        return (dirtyMask & (1L << block)) != 0L;
+    }
+
+    public static void clearBit(int block)
+    {
+        dirtyMask &= ~(1L << block);
+    }
+
+    public static void clearAll()
+    {
+        dirtyMask = 0L;
+    }
+
+    /** Rebuild every dirty block's pyramid (all 6 faces) in one batch. Call once
      *  per bake, after the point loop (before the SSBO flush / Iris passes). */
     public static void flushDirty()
     {
-        if (dirtyMask == 0)
+        if (dirtyMask == 0L)
         {
             return;
         }
-        int mask = dirtyMask;
-        dirtyMask = 0;
-        int depthTex = PointShadowArray.getGlTextureId();
+        long mask = dirtyMask;
+        dirtyMask = 0L;
+        int depthTex = PointDepthAtlas.getGlTextureId();
         if (depthTex == 0)
         {
             return;
         }
-        ensureResources();
-        if (texId == 0 || progCube == 0 || progMip == 0)
+        ensurePrograms();
+        if (progCube == 0 || progMip == 0)
         {
             return; // inert on failure — the GLSL pyrMax>0 guard falls back to full PCSS
+        }
+        ensureCapacities(mask);
+
+        ShadowBakeProbe probe = ShadowEngine.bakeProbe();
+        if (probe != null)
+        {
+            probe.counter("pyr.pt", Long.bitCount(mask));
         }
 
         // --- save the touched state once per batch ---
         int prevProgram = GL11.glGetInteger(GL20.GL_CURRENT_PROGRAM);
         int unit = GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE) - GL13.GL_TEXTURE0;
-        int prevCube = GL11.glGetInteger(GL40.GL_TEXTURE_BINDING_CUBE_MAP_ARRAY);
+        int prevTex = GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D);
         int prevArr = GL11.glGetInteger(GL30.GL_TEXTURE_BINDING_2D_ARRAY);
         int prevImgName = GL30.glGetIntegeri(GL42.GL_IMAGE_BINDING_NAME, 0);
         int prevImgLevel = GL30.glGetIntegeri(GL42.GL_IMAGE_BINDING_LEVEL, 0);
@@ -158,50 +186,80 @@ public final class PointShadowPyramid
 
         GL42.glMemoryBarrier(GL42.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
-        int base = PointShadowArray.FACE_SIZE / 2;
-
-        // pass 0: depth cube -> pyramid lod 0, all dirty slots (z = 6 faces per dispatch), one barrier
+        // pass 0: depth atlas -> pyramid lod 0, all dirty blocks tier by tier
+        // (blocks are tier-contiguous), one barrier for the whole pass
         GlStateManager._glUseProgram(progCube);
         GL20.glUniform1i(uCubeSrc, unit);
-        GL11.glBindTexture(GL40.GL_TEXTURE_CUBE_MAP_ARRAY, depthTex);
-        GL42.glBindImageTexture(0, texId, 0, true, 0, GL15.GL_WRITE_ONLY, GL30.GL_RG32F);
-        GL20.glUniform2i(uCubeDstSize, base, base);
-        for (int slot = 0; slot < PointShadowArray.MAX_SHADOWS; slot++)
+        GlStateManager._bindTexture(depthTex);
+        for (int t = 0; t < 3; t++)
         {
-            if ((mask & (1 << slot)) == 0)
+            int base = PointDepthAtlas.tierFaceSizePx(t) / 2;
+            int start = PointDepthAtlas.tierStartBlock(t);
+            // capBlocks-bounded: a block past the tier's physical capacity
+            // (growth denied by the budget) has no layers to write
+            int end = start + Math.min(PointDepthAtlas.tierBlockCount(t), capBlocks[t]);
+            boolean bound = false;
+            for (int b = start; b < end; b++)
             {
-                continue;
-            }
-            GL20.glUniform1i(uCubeSlot, slot);
-            GL43.glDispatchCompute((base + 7) / 8, (base + 7) / 8, 6);
-        }
-        GL42.glMemoryBarrier(GL42.GL_TEXTURE_FETCH_BARRIER_BIT);
-
-        // passes 1..levels-1: one image bind + one barrier per LEVEL, all dirty slots
-        GlStateManager._glUseProgram(progMip);
-        GL20.glUniform1i(uMipSrc, unit);
-        GL11.glBindTexture(GL30.GL_TEXTURE_2D_ARRAY, texId);
-        for (int lod = 1; lod < levels; lod++)
-        {
-            int dstW = base >> lod;
-            GL20.glUniform1i(uMipSrcLod, lod - 1);
-            GL42.glBindImageTexture(0, texId, lod, true, 0, GL15.GL_WRITE_ONLY, GL30.GL_RG32F);
-            GL20.glUniform2i(uMipDstSize, dstW, dstW);
-            for (int slot = 0; slot < PointShadowArray.MAX_SHADOWS; slot++)
-            {
-                if ((mask & (1 << slot)) == 0)
+                if ((mask & (1L << b)) == 0L)
                 {
                     continue;
                 }
-                GL20.glUniform1i(uMipLayerBase, slot * 6);
-                GL43.glDispatchCompute((dstW + 7) / 8, (dstW + 7) / 8, 6);
+                if (!bound)
+                {
+                    GL42.glBindImageTexture(0, texId[t], 0, true, 0, GL15.GL_WRITE_ONLY, GL30.GL_RG32F);
+                    GL20.glUniform2i(uCubeDstSize, base, base);
+                    bound = true;
+                }
+                GL20.glUniform1i(uCubeSlot, b - start);
+                GL20.glUniform2i(uCubeBlockOrigin, PointDepthAtlas.blockPixelX(b), PointDepthAtlas.blockPixelY(b));
+                GL43.glDispatchCompute((base + 7) / 8, (base + 7) / 8, 6);
             }
-            GL42.glMemoryBarrier(GL42.GL_TEXTURE_FETCH_BARRIER_BIT);
+        }
+        GL42.glMemoryBarrier(GL42.GL_TEXTURE_FETCH_BARRIER_BIT);
+
+        // passes 1..levels-1, tier by tier: one image bind + one barrier per
+        // LEVEL, all the tier's dirty blocks (same barrier count as the three
+        // per-tier flushes of the cube-array layout)
+        GlStateManager._glUseProgram(progMip);
+        GL20.glUniform1i(uMipSrc, unit);
+        for (int t = 0; t < 3; t++)
+        {
+            int start = PointDepthAtlas.tierStartBlock(t);
+            int end = start + Math.min(PointDepthAtlas.tierBlockCount(t), capBlocks[t]);
+            long tierBits = 0L;
+            for (int b = start; b < end; b++)
+            {
+                tierBits |= mask & (1L << b);
+            }
+            if (tierBits == 0L)
+            {
+                continue;
+            }
+            int base = PointDepthAtlas.tierFaceSizePx(t) / 2;
+            GL11.glBindTexture(GL30.GL_TEXTURE_2D_ARRAY, texId[t]);
+            for (int lod = 1; lod < levels[t]; lod++)
+            {
+                int dstW = base >> lod;
+                GL20.glUniform1i(uMipSrcLod, lod - 1);
+                GL42.glBindImageTexture(0, texId[t], lod, true, 0, GL15.GL_WRITE_ONLY, GL30.GL_RG32F);
+                GL20.glUniform2i(uMipDstSize, dstW, dstW);
+                for (int b = start; b < end; b++)
+                {
+                    if ((mask & (1L << b)) == 0L)
+                    {
+                        continue;
+                    }
+                    GL20.glUniform1i(uMipLayerBase, (b - start) * 6);
+                    GL43.glDispatchCompute((dstW + 7) / 8, (dstW + 7) / 8, 6);
+                }
+                GL42.glMemoryBarrier(GL42.GL_TEXTURE_FETCH_BARRIER_BIT);
+            }
         }
 
         // --- restore ---
         GL11.glBindTexture(GL30.GL_TEXTURE_2D_ARRAY, prevArr);
-        GL11.glBindTexture(GL40.GL_TEXTURE_CUBE_MAP_ARRAY, prevCube);
+        GlStateManager._bindTexture(prevTex);
         GlStateManager._glUseProgram(prevProgram);
         if (prevImgName == 0)
         {
@@ -213,46 +271,157 @@ public final class PointShadowPyramid
         }
     }
 
-    private static void ensureResources()
+    /** Blocks of tier {@code t} the array physically backs (0 = none). */
+    static int allocatedBlocks(int t)
     {
-        if (!programsAttempted)
+        return capBlocks[t];
+    }
+
+    /** True when the compute programs failed to build — this filter will
+     *  never allocate or dispatch, so it must not constrain the budget. */
+    static boolean inert()
+    {
+        return programsAttempted && (progCube == 0 || progMip == 0);
+    }
+
+    /** Bytes of the currently resident tier arrays — feeds the preset-flip
+     *  budget's "about to be freed" accounting. */
+    static long allocatedBytes()
+    {
+        long total = 0;
+        for (int t = 0; t < 3; t++)
         {
-            programsAttempted = true;
-            progCube = buildProgram(CUBE_SRC, "cube");
-            progMip = buildProgram(MIP_SRC, "mip");
-            if (progCube != 0)
+            if (capBlocks[t] > 0)
             {
-                uCubeSrc = GL20.glGetUniformLocation(progCube, "srcCube");
-                uCubeSlot = GL20.glGetUniformLocation(progCube, "slot");
-                uCubeDstSize = GL20.glGetUniformLocation(progCube, "dstSize");
-            }
-            if (progMip != 0)
-            {
-                uMipSrc = GL20.glGetUniformLocation(progMip, "srcFlat");
-                uMipSrcLod = GL20.glGetUniformLocation(progMip, "srcLod");
-                uMipLayerBase = GL20.glGetUniformLocation(progMip, "layerBase");
-                uMipDstSize = GL20.glGetUniformLocation(progMip, "dstSize");
+                int base = PointDepthAtlas.tierFaceSizePx(t) / 2;
+                total += ShadowAllocLog.mipChainBytes(base, levels[t], 8L) * capBlocks[t] * 6L;
             }
         }
-        if (progCube == 0 || progMip == 0 || texId != 0)
+        return total;
+    }
+
+    /** Per-tier cooldown (in flushes) after a failed glTexStorage3D — bounds
+     *  the retry/log storm of a genuinely OOM'd card while still recovering
+     *  once VRAM frees up. */
+    private static final int[] growRetryDelay = new int[3];
+
+    private static void ensurePrograms()
+    {
+        if (programsAttempted)
         {
             return;
         }
+        programsAttempted = true;
+        progCube = buildProgram(CUBE_SRC, "cube");
+        progMip = buildProgram(MIP_SRC, "mip");
+        if (progCube != 0)
+        {
+            uCubeSrc = GL20.glGetUniformLocation(progCube, "srcAtlas");
+            uCubeSlot = GL20.glGetUniformLocation(progCube, "slot");
+            uCubeDstSize = GL20.glGetUniformLocation(progCube, "dstSize");
+            uCubeBlockOrigin = GL20.glGetUniformLocation(progCube, "blockOrigin");
+        }
+        if (progMip != 0)
+        {
+            uMipSrc = GL20.glGetUniformLocation(progMip, "srcFlat");
+            uMipSrcLod = GL20.glGetUniformLocation(progMip, "srcLod");
+            uMipLayerBase = GL20.glGetUniformLocation(progMip, "layerBase");
+            uMipDstSize = GL20.glGetUniformLocation(progMip, "dstSize");
+        }
+    }
 
+    /** Grow every tier the dirty mask touches past its current capacity, up
+     *  to the budget-approved block count (demand-sized: a tier no lamp ever
+     *  ranks into never allocates). */
+    private static void ensureCapacities(long mask)
+    {
         int prevArr = GL11.glGetInteger(GL30.GL_TEXTURE_BINDING_2D_ARRAY);
-        texId = GL11.glGenTextures();
-        GL11.glBindTexture(GL30.GL_TEXTURE_2D_ARRAY, texId);
-        // base = face/2; levels = log2(FACE_SIZE): the deepest lod is one texel per face
-        levels = Integer.numberOfTrailingZeros(Integer.highestOneBit(PointShadowArray.FACE_SIZE));
-        int base = PointShadowArray.FACE_SIZE / 2;
-        GL43.glTexStorage3D(GL30.GL_TEXTURE_2D_ARRAY, levels, GL30.GL_RG32F, base, base, PointShadowArray.LAYER_COUNT);
+        for (int t = 0; t < 3; t++)
+        {
+            int start = PointDepthAtlas.tierStartBlock(t);
+            int needed = 0;
+            for (int b = start + PointDepthAtlas.tierBlockCount(t) - 1; b >= start; b--)
+            {
+                if ((mask & (1L << b)) != 0L)
+                {
+                    needed = b - start + 1;
+                    break;
+                }
+            }
+            if (needed > capBlocks[t] || (needed > 0 && texId[t] == 0))
+            {
+                if (growRetryDelay[t] > 0)
+                {
+                    growRetryDelay[t]--; // OOM cooldown; writes stay capBlocks-bounded
+                }
+                else
+                {
+                    // approved >= needed by the acquire-cap invariant; max() keeps
+                    // a stray block writable even if that invariant ever slips
+                    ensureTier(t, Math.max(needed, ShadowVramBudget.approvedPointBlocks(t)));
+                }
+            }
+        }
+        GL11.glBindTexture(GL30.GL_TEXTURE_2D_ARRAY, prevArr);
+    }
+
+    /** (Re)allocate tier {@code t} at {@code targetBlocks} blocks (layers =
+     *  blocks*6, same level count), preserving the already-filtered layers of
+     *  the old array via a per-level GPU copy — growth must not force a
+     *  re-bake of untouched blocks. Leaves GL_TEXTURE_2D_ARRAY bound to the
+     *  new texture (the caller restores). */
+    private static void ensureTier(int t, int targetBlocks)
+    {
+        targetBlocks = Math.min(targetBlocks, PointDepthAtlas.tierBlockCount(t));
+        if (targetBlocks <= capBlocks[t] && texId[t] != 0)
+        {
+            return;
+        }
+        int face = PointDepthAtlas.tierFaceSizePx(t);
+        int base = face / 2;
+        int lv = Integer.numberOfTrailingZeros(Integer.highestOneBit(face));
+        int newTex = GL11.glGenTextures();
+        GL11.glBindTexture(GL30.GL_TEXTURE_2D_ARRAY, newTex);
+        GL43.glTexStorage3D(GL30.GL_TEXTURE_2D_ARRAY, lv, GL30.GL_RG32F, base, base, targetBlocks * 6);
+        // GL_TEXTURE_IMMUTABLE_FORMAT flips to TRUE only on a successful
+        // glTexStorage* — on OOM the name has no storage: keep the old valid
+        // array (and its filtered data) untouched and retry after a cooldown
+        if (GL11.glGetTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL42.GL_TEXTURE_IMMUTABLE_FORMAT) != GL11.GL_TRUE)
+        {
+            GL11.glDeleteTextures(newTex);
+            growRetryDelay[t] = 600;
+            System.err.println("[irl-core] PointShadowPyramid: t" + t + " glTexStorage3D "
+                + base + "^2 x" + (targetBlocks * 6) + " failed (VRAM?); keeping "
+                + capBlocks[t] + " blocks, retry in " + growRetryDelay[t] + " flushes");
+            return;
+        }
+        ShadowAllocLog.log("point-pyr t" + t + " " + base + "^2 x" + (targetBlocks * 6)
+                + "/" + (PointDepthAtlas.tierBlockCount(t) * 6) + " rg32f",
+            ShadowAllocLog.mipChainBytes(base, lv, 8L) * targetBlocks * 6L);
         GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);
         GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST);
         GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_WRAP_S, GL12.GL_CLAMP_TO_EDGE);
         GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL11.GL_TEXTURE_WRAP_T, GL12.GL_CLAMP_TO_EDGE);
         GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL12.GL_TEXTURE_BASE_LEVEL, 0);
-        GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL12.GL_TEXTURE_MAX_LEVEL, levels - 1);
-        GL11.glBindTexture(GL30.GL_TEXTURE_2D_ARRAY, prevArr);
+        GL11.glTexParameteri(GL30.GL_TEXTURE_2D_ARRAY, GL12.GL_TEXTURE_MAX_LEVEL, lv - 1);
+        if (texId[t] != 0 && capBlocks[t] > 0)
+        {
+            // order prior imageStore writes before the copy reads them
+            GL42.glMemoryBarrier(GL42.GL_ALL_BARRIER_BITS);
+            for (int lod = 0; lod < lv; lod++)
+            {
+                int w = Math.max(1, base >> lod);
+                GL43.glCopyImageSubData(texId[t], GL30.GL_TEXTURE_2D_ARRAY, lod, 0, 0, 0,
+                    newTex, GL30.GL_TEXTURE_2D_ARRAY, lod, 0, 0, 0, w, w, capBlocks[t] * 6);
+            }
+        }
+        if (texId[t] != 0)
+        {
+            GL11.glDeleteTextures(texId[t]);
+        }
+        texId[t] = newTex;
+        levels[t] = lv;
+        capBlocks[t] = targetBlocks;
     }
 
     private static int buildProgram(String src, String tag)
@@ -279,17 +448,22 @@ public final class PointShadowPyramid
         return prog;
     }
 
-    /** Free the texture (called with PointShadowArray.delete(), e.g. preset
+    /** Free the textures (called with PointDepthAtlas.delete(), e.g. preset
      *  switch). 2D-array bindings are not tracked by GlStateManager, so a raw
      *  delete is safe here (unlike the 2D spot pyramid). */
     public static void delete()
     {
-        if (texId != 0)
+        for (int t = 0; t < 3; t++)
         {
-            GL11.glDeleteTextures(texId);
-            texId = 0;
+            if (texId[t] != 0)
+            {
+                GL11.glDeleteTextures(texId[t]);
+                texId[t] = 0;
+            }
+            levels[t] = 0;
+            capBlocks[t] = 0;
+            growRetryDelay[t] = 0;
         }
-        levels = 0;
-        dirtyMask = 0;
+        clearAll();
     }
 }

@@ -168,7 +168,7 @@ public final class ShadowRenderer
         GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, SpotlightDepthAtlas.getFboId(toStatic));
         int px = SpotlightDepthAtlas.tilePixelX(tile);
         int py = SpotlightDepthAtlas.tilePixelY(tile);
-        int ts = SpotlightDepthAtlas.TILE_SIZE;
+        int ts = SpotlightDepthAtlas.tileSizePx(tile);
         GL11.glViewport(px, py, ts, ts);
         GL11.glEnable(GL11.GL_SCISSOR_TEST);
         GL11.glScissor(px, py, ts, ts);
@@ -197,13 +197,37 @@ public final class ShadowRenderer
         );
     }
 
+    /** Shrink the current spot tile's scissor to a partial sub-rect (the 1.1.3
+     *  dyn-rect / partial-tile bake path). Call between {@link #beginSpot} (which
+     *  set the full-tile scissor; the viewport/NDC mapping stays full-tile) and
+     *  the caster draws; {@link #endPass} restores the caller's scissor. */
+    public static void restrictScissorSpot(int tile, int localX, int localY, int w, int h)
+    {
+        int px = SpotlightDepthAtlas.tilePixelX(tile);
+        int py = SpotlightDepthAtlas.tilePixelY(tile);
+        GL11.glScissor(px + localX, py + localY, w, h);
+    }
+
+    /** DIAGNOSTIC (-Dirlite.dynRectDebug=true): clear the CURRENTLY SCISSORED
+     *  depth region to the near plane so the partial-tile dyn rect shows up in
+     *  the world as a fully-shadowed block. Call right after
+     *  {@link #restrictScissorSpot}. */
+    public static void debugFillScissoredDepth()
+    {
+        GL11.glClearDepth(0.0);
+        GL11.glClear(GL11.GL_DEPTH_BUFFER_BIT);
+        GL11.glClearDepth(1.0);
+    }
+
     /**
-     * Begin a point-cube face depth pass into the live or static array (see
+     * Begin a point-cube face depth pass into the live or static atlas (see
      * {@link #beginSpot} for the {@code toStatic}/{@code clear} semantics; the
-     * static base of a whole cube is restored by
-     * {@link PointShadowArray#copyStaticToLive}).
+     * static base of a whole block is restored by
+     * {@link PointDepthAtlas#copyStaticToLive}). {@code block} is the GLOBAL
+     * point-atlas block index; each of the 6 cube faces renders into its own
+     * pixel sub-rect of that block's atlas region.
      */
-    public static void beginPointFace(int slot, int face,
+    public static void beginPointFace(int block, int face,
                                       double lpx, double lpy, double lpz,
                                       float radius,
                                       boolean toStatic, boolean clear)
@@ -220,11 +244,13 @@ public final class ShadowRenderer
         float ey = (float) (lpy - currentOriginY);
         float ez = (float) (lpz - currentOriginZ);
 
-        PointShadowArray.bindFaceForRender(slot, face, toStatic);
-        int fs = PointShadowArray.FACE_SIZE;
-        GL11.glViewport(0, 0, fs, fs);
+        GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, PointDepthAtlas.getFboId(toStatic));
+        int px = PointDepthAtlas.facePixelX(block, face);
+        int py = PointDepthAtlas.facePixelY(block, face);
+        int fs = PointDepthAtlas.faceSizePx(block);
+        GL11.glViewport(px, py, fs, fs);
         GL11.glEnable(GL11.GL_SCISSOR_TEST);
-        GL11.glScissor(0, 0, fs, fs);
+        GL11.glScissor(px, py, fs, fs);
         if (clear)
         {
             GL11.glDepthMask(true);

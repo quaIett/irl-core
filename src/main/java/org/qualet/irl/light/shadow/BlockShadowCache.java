@@ -6,8 +6,10 @@ import it.unimi.dsi.fastutil.longs.LongIterator;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import it.unimi.dsi.fastutil.longs.LongSet;
 import it.unimi.dsi.fastutil.objects.ObjectIterator;
+import net.minecraft.block.BlockState;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.world.BlockView;
 
 import java.util.List;
 
@@ -23,8 +25,10 @@ import java.util.List;
  *   1. Light moved into another 1-block cell / range crossed a whole block ->
  *      hash mismatch in getOrCompute (checked every frame, cheap; the sphere
  *      is quantized so sub-block motion of a moving lamp does NOT re-collect).
- *   2. A block in range changed -> invalidateAt(pos) from WorldBlockChangeMixin,
- *      via a section index (chunk-section key -> set of light ids overlapping it).
+ *   2. A block in range changed -> invalidateChange(world, pos, old, new) from
+ *      WorldBlockChangeMixin, via a section index (chunk-section key -> set of
+ *      light ids overlapping it), gated on the swap actually altering a
+ *      silhouette (invalidateAt(pos) is the ungated legacy entry point).
  *   3. Light no longer present -> retainOnly(liveIds) evicts it (and drains the
  *      whole cache when the feature is off, since liveIds is empty then).
  *
@@ -127,12 +131,47 @@ public final class BlockShadowCache
      */
     public static boolean invalidateAt(BlockPos pos)
     {
-        long key = sectionKey(pos.getX() >> 4, pos.getY() >> 4, pos.getZ() >> 4);
-        LongOpenHashSet ids = sectionToLightIds.get(key);
-        if (ids == null || ids.isEmpty())
+        LongOpenHashSet ids = idsCovering(pos);
+        if (ids == null)
         {
             return false;
         }
+        return invalidateSphere(ids, pos);
+    }
+
+    /**
+     * Change-aware variant for callers that know both sides of the edit: skips
+     * the invalidation entirely when the swap provably can't alter any baked
+     * silhouette ({@link BlockShadowCollector#sameSilhouette}) — grass->dirt,
+     * fluid level ticks, a furnace lighting up. The silhouette test runs only
+     * after the section index confirms a lamp is actually nearby, so the
+     * common far-away edit still costs one hash lookup.
+     */
+    public static boolean invalidateChange(BlockView world, BlockPos pos,
+                                           BlockState oldState, BlockState newState)
+    {
+        LongOpenHashSet ids = idsCovering(pos);
+        if (ids == null)
+        {
+            return false;
+        }
+        if (BlockShadowCollector.sameSilhouette(world, pos, oldState, newState))
+        {
+            return false;
+        }
+        return invalidateSphere(ids, pos);
+    }
+
+    /** Lights whose section index touches this position, or null if none. */
+    private static LongOpenHashSet idsCovering(BlockPos pos)
+    {
+        long key = sectionKey(pos.getX() >> 4, pos.getY() >> 4, pos.getZ() >> 4);
+        LongOpenHashSet ids = sectionToLightIds.get(key);
+        return (ids == null || ids.isEmpty()) ? null : ids;
+    }
+
+    private static boolean invalidateSphere(LongOpenHashSet ids, BlockPos pos)
+    {
         // Block CENTER, matching BlockShadowCollector's per-block keep test
         // (it keeps blocks whose center is within the snapped radius).
         float bx = pos.getX() + 0.5f;
