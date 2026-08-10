@@ -65,6 +65,19 @@ public interface ShadowConfig
         return 1.0f;
     }
 
+    /** Enables the partial-tile spot overlay (dyn-rect scissor + partial
+     *  static-&gt;live copy + partial filter rebuild). The rect is a HARD bound
+     *  built from caster HITBOXES plus the {@link #shadowPoseReach} slack, so
+     *  content drawn far past its hitbox can clip at the rect edge, moving with
+     *  the subject; switching this off restores the always-correct full-tile
+     *  paths at the full per-overlay-frame copy + filter cost. Pulled fresh
+     *  every bake (live knob). OPTIONAL (a {@code default}): mods that predate
+     *  it keep compiling with the optimization on. */
+    default boolean shadowPartialTile()
+    {
+        return true;
+    }
+
     /** Master enable for the whole bake. When false, {@link ShadowBaker} skips the
      *  depth render, the filter flushes, the pyramid builds and the tile/VRAM
      *  allocation entirely, releasing what it held — so a mod's "shadows off"
@@ -115,6 +128,7 @@ public interface ShadowConfig
         private BooleanSupplier shadowBlocks;
         private IntSupplier shadowBlockRadius;
         private DoubleSupplier shadowPoseReach;
+        private BooleanSupplier shadowPartialTile;
         private BooleanSupplier shadowsEnabled;
 
         private Builder()
@@ -158,6 +172,14 @@ public interface ShadowConfig
             return this;
         }
 
+        /** OPTIONAL: omitted = the interface default (partial path on), so
+         *  pre-existing shims keep building unchanged. */
+        public Builder shadowPartialTile(BooleanSupplier shadowPartialTile)
+        {
+            this.shadowPartialTile = shadowPartialTile;
+            return this;
+        }
+
         /** OPTIONAL: omitted = the interface default (always enabled), so shims
          *  that predate the bake gate keep building and keep baking. */
         public Builder shadowsEnabled(BooleanSupplier shadowsEnabled)
@@ -173,8 +195,9 @@ public interface ShadowConfig
             IntSupplier bakeBudget = requireNonNull(shadowBakeBudget, "shadowBakeBudget");
             BooleanSupplier blocks = requireNonNull(shadowBlocks, "shadowBlocks");
             IntSupplier blockRadius = requireNonNull(shadowBlockRadius, "shadowBlockRadius");
-            DoubleSupplier poseReach = shadowPoseReach; // optional, may be null
-            BooleanSupplier enabled = shadowsEnabled;   // optional, may be null
+            DoubleSupplier poseReach = shadowPoseReach;    // optional, may be null
+            BooleanSupplier partial = shadowPartialTile;   // optional, may be null
+            BooleanSupplier enabled = shadowsEnabled;      // optional, may be null
             return new ShadowConfig()
             {
                 public int shadowQuality()     { return quality.getAsInt(); }
@@ -183,6 +206,7 @@ public interface ShadowConfig
                 public boolean shadowBlocks()  { return blocks.getAsBoolean(); }
                 public int shadowBlockRadius() { return blockRadius.getAsInt(); }
                 public float shadowPoseReach() { return poseReach == null ? 1.0f : (float) poseReach.getAsDouble(); }
+                public boolean shadowPartialTile() { return partial == null || partial.getAsBoolean(); }
                 public boolean shadowsEnabled() { return enabled == null || enabled.getAsBoolean(); }
             };
         }

@@ -149,7 +149,9 @@ public final class ShadowBaker
     private static final Long2LongOpenHashMap lastDynRect = new Long2LongOpenHashMap();
 
     /** Kill switch for the partial-tile spot overlay (copy/scissor/filter
-     *  rects): -Dirlite.noPartialFilter=true restores the full-tile paths. */
+     *  rects): -Dirlite.noPartialFilter=true restores the full-tile paths.
+     *  The per-mod LIVE toggle is {@link ShadowConfig#shadowPartialTile()},
+     *  checked next to this flag at the single overlay gate. */
     private static final boolean NO_PARTIAL = Boolean.getBoolean("irlite.noPartialFilter");
 
     /** Diagnostic bisect of the partial-tile path
@@ -402,6 +404,10 @@ public final class ShadowBaker
         if (!PROFILE)
         {
             bakeInner(world, cameraPos, cameraForward, tickDelta);
+            if (ShadowClipTelemetry.ENABLED)
+            {
+                ShadowClipTelemetry.recordFrame();
+            }
             return;
         }
 
@@ -413,6 +419,10 @@ public final class ShadowBaker
         finally
         {
             profRecordFrame(System.nanoTime() - t0);
+            if (ShadowClipTelemetry.ENABLED)
+            {
+                ShadowClipTelemetry.recordFrame();
+            }
         }
     }
 
@@ -559,6 +569,10 @@ public final class ShadowBaker
             // at all — neither entities nor world blocks. Forcing both inputs
             // empty drops it into the same "nothing in range" skip below, leaving
             // its shadow tile unassigned (-1 = none in the SSBO -> unshadowed).
+            if (ShadowClipTelemetry.ENABLED)
+            {
+                ShadowClipTelemetry.beginScan(id, true);
+            }
             int entInRange = castsShadows ? scanInRange(lx, ly, lz, range, ndx, ndy, ndz, coneTheta, cone) : 0;
             // Collect blocks every frame (NOT gated on dirty): the skip/tile
             // decision must match the frame that actually baked, or the atlas
@@ -874,10 +888,10 @@ public final class ShadowBaker
                 // invalidates the whole tile's filtered content -> FULL.
                 int ts = SpotlightDepthAtlas.tileSizePx(myTile);
                 long dynRect = ShadowRect.FULL;
-                if (!NO_PARTIAL && dyn && !bakedStatic)
+                if (!NO_PARTIAL && ShadowEngine.config().shadowPartialTile() && dyn && !bakedStatic)
                 {
                     dynRect = computeSpotDynRect(lx, ly, lz, lxD, lyD, lzD,
-                        ndx, ndy, ndz, cone, range, outerDeg, ts);
+                        ndx, ndy, ndz, cone, range, outerDeg, ts, id);
                 }
                 long copyRect = (bakedStatic || PARTIAL_FULL_FILTERS) ? ShadowRect.FULL
                     : ShadowRect.union(dynRect, lastDynRect.containsKey(id) ? lastDynRect.get(id) : ShadowRect.FULL);
@@ -1040,6 +1054,10 @@ public final class ShadowBaker
             // See the spot loop: "Shadows" off -> no entities, no blocks.
             // Points are omnidirectional -> no cone cull (cone=false); the 6 cube
             // faces are culled individually in renderInRangeFace below.
+            if (ShadowClipTelemetry.ENABLED)
+            {
+                ShadowClipTelemetry.beginScan(id, false);
+            }
             int entInRange = castsShadows ? scanInRange(lx, ly, lz, radius, 0f, 0f, 0f, 0f, false) : 0;
             // Collected once, reused across all 6 cube faces (see spot note);
             // behind lights skip the collect when entInRange already decides
@@ -1985,13 +2003,52 @@ public final class ShadowBaker
         {
             float ddx = ox[k] - lx, ddy = oy[k] - ly, ddz = oz[k] - lz;
             float reach = reachBase + orad[k];
-            if (ddx * ddx + ddy * ddy + ddz * ddz > reach * reach)
+            float d2c = ddx * ddx + ddy * ddy + ddz * ddz;
+            if (d2c > reach * reach)
             {
+                if (ShadowClipTelemetry.ENABLED)
+                {
+                    // Probe: a sphere honest up to xMUL+ADD would have passed ->
+                    // potential whole-shadow vanish at the range boundary.
+                    float probeReach = reachBase
+                        + orad[k] * ShadowClipTelemetry.PROBE_MUL + ShadowClipTelemetry.PROBE_ADD;
+                    if (d2c <= probeReach * probeReach)
+                    {
+                        ShadowClipTelemetry.noteRangeMiss(occType[k], ox[k], oy[k], oz[k],
+                            (float) Math.sqrt(d2c) - reach);
+                    }
+                }
                 continue;
             }
             if (cone && !insideCone(dirX, dirY, dirZ, coneTheta, ddx, ddy, ddz, orad[k]))
             {
+                if (ShadowClipTelemetry.ENABLED
+                    && insideCone(dirX, dirY, dirZ, coneTheta, ddx, ddy, ddz,
+                        orad[k] * ShadowClipTelemetry.PROBE_MUL + ShadowClipTelemetry.PROBE_ADD))
+                {
+                    // Probe flips the cone verdict -> potential vanish at the cone edge.
+                    ShadowClipTelemetry.noteConeMiss(occType[k], ox[k], oy[k], oz[k]);
+                }
                 continue;
+            }
+            if (ShadowClipTelemetry.ENABLED)
+            {
+                // Declared sphere already crosses the bake far plane (= reachBase):
+                // the caster's far side is range-clipped even with an honest sphere.
+                // The far cut is AXIAL view-depth, not radial distance — spot views
+                // look along the cone axis, point faces along each face axis (the
+                // dominant component bounds all touched faces) — so measure the
+                // matching axial depth or casters near the radial boundary would
+                // report phantom far-crossings. (A degenerate-dir spot scans with
+                // cone=false and gets the point-style bound; telemetry-only.)
+                float axial = cone
+                    ? ddx * dirX + ddy * dirY + ddz * dirZ
+                    : Math.max(Math.abs(ddx), Math.max(Math.abs(ddy), Math.abs(ddz)));
+                float overhang = axial + orad[k] - reachBase;
+                if (overhang > 0f)
+                {
+                    ShadowClipTelemetry.noteFarCross(occType[k], ox[k], oy[k], oz[k], overhang);
+                }
             }
             // Passed range (+ cone for spots): shortlist it so the render passes
             // re-use this verdict instead of re-testing. For POINT scans
@@ -2007,6 +2064,29 @@ public final class ShadowBaker
                     if (sphereTouchesFace(face, ddx, ddy, ddz, kr))
                     {
                         faceMask |= 1 << face;
+                    }
+                }
+                if (ShadowClipTelemetry.ENABLED)
+                {
+                    float pkr = (orad[k] * ShadowClipTelemetry.PROBE_MUL
+                        + ShadowClipTelemetry.PROBE_ADD) * SQRT2;
+                    int probeMask = 0;
+                    for (int face = 0; face < 6; face++)
+                    {
+                        if (sphereTouchesFace(face, ddx, ddy, ddz, pkr))
+                        {
+                            probeMask |= 1 << face;
+                        }
+                    }
+                    int missingFaces = probeMask & ~faceMask;
+                    if (missingFaces != 0)
+                    {
+                        // Probe reaches faces the declared sphere is not drawn
+                        // into -> potential razor cut along a cube-face seam.
+                        // Gained-faces only: a sub-1 clipProbeMul (shrinking
+                        // probe) must go silent, not count lost faces.
+                        ShadowClipTelemetry.noteFaceMiss(occType[k], ox[k], oy[k], oz[k],
+                            missingFaces);
                     }
                 }
             }
@@ -2123,12 +2203,13 @@ public final class ShadowBaker
      * knob must be able to outgrow the hitbox's cull sphere in any
      * direction. The scissor set from this rect is the HARD bound for those
      * writes, so an under-estimate degrades to visible silhouette clipping,
-     * never to the filters missing fresh depth.
+     * never to the filters missing fresh depth. {@code id} is the light id,
+     * consumed only by the clip telemetry ({@link ShadowClipTelemetry}).
      */
     private static long computeSpotDynRect(float lx, float ly, float lz,
                                            double lxD, double lyD, double lzD,
                                            float ndx, float ndy, float ndz, boolean validDir,
-                                           float range, float outerDeg, int ts)
+                                           float range, float outerDeg, int ts, long id)
     {
         if (!validDir)
         {
@@ -2163,6 +2244,10 @@ public final class ShadowBaker
         float minU = Float.POSITIVE_INFINITY, minV = Float.POSITIVE_INFINITY;
         float maxU = Float.NEGATIVE_INFINITY, maxV = Float.NEGATIVE_INFINITY;
         boolean any = false;
+        // Telemetry probe union (inflated extents); bail mirrors the near-plane rule.
+        float pMinU = Float.POSITIVE_INFINITY, pMinV = Float.POSITIVE_INFINITY;
+        float pMaxU = Float.NEGATIVE_INFINITY, pMaxV = Float.NEGATIVE_INFINITY;
+        boolean probeBailed = false;
         for (int s = 0; s < shortCount; s++)
         {
             int k = shortIdx[s];
@@ -2202,6 +2287,34 @@ public final class ShadowBaker
                 maxU = Math.max(maxU, u);
                 maxV = Math.max(maxV, v);
             }
+            if (ShadowClipTelemetry.ENABLED && !probeBailed)
+            {
+                // Same projection with probe-inflated extents: if the probe rect
+                // outgrows the armed rect, geometry that much past the hitbox is
+                // being scissored (the documented silhouette-clip failure mode).
+                float phh = orh[k] * ShadowClipTelemetry.PROBE_MUL + ShadowClipTelemetry.PROBE_ADD + slack;
+                float phy = ohv[k] * ShadowClipTelemetry.PROBE_MUL + ShadowClipTelemetry.PROBE_ADD + slack;
+                for (int corner = 0; corner < 8; corner++)
+                {
+                    dynRectVec.set(
+                        cx + (((corner & 1) == 0) ? -phh : phh),
+                        cy + (((corner & 2) == 0) ? -phy : phy),
+                        cz + (((corner & 4) == 0) ? -phh : phh),
+                        1f);
+                    dynRectMatrix.transform(dynRectVec);
+                    if (dynRectVec.w < 0.05f)
+                    {
+                        probeBailed = true;
+                        break;
+                    }
+                    float pu = (dynRectVec.x / dynRectVec.w * 0.5f + 0.5f) * ts;
+                    float pv = (dynRectVec.y / dynRectVec.w * 0.5f + 0.5f) * ts;
+                    pMinU = Math.min(pMinU, pu);
+                    pMinV = Math.min(pMinV, pv);
+                    pMaxU = Math.max(pMaxU, pu);
+                    pMaxV = Math.max(pMaxV, pv);
+                }
+            }
         }
         if (!any)
         {
@@ -2217,7 +2330,32 @@ public final class ShadowBaker
             return ShadowRect.FULL; // fully off-tile after clamp — shouldn't happen for cone-culled casters
         }
         long rect = ShadowRect.pack(x0, y0, x1, y1);
-        return ShadowRect.coversMost(rect, ts, COVERS_MOST_NUM, COVERS_MOST_DEN) ? ShadowRect.FULL : rect;
+        if (ShadowRect.coversMost(rect, ts, COVERS_MOST_NUM, COVERS_MOST_DEN))
+        {
+            return ShadowRect.FULL;
+        }
+        if (ShadowClipTelemetry.ENABLED)
+        {
+            if (probeBailed)
+            {
+                // Probe corner at/behind the near plane while the armed rect is
+                // partial: report a full-tile-magnitude escape.
+                ShadowClipTelemetry.noteRectTight(id, ts);
+            }
+            else
+            {
+                int px0 = Math.max(0, (int) Math.floor(pMinU) - 1);
+                int py0 = Math.max(0, (int) Math.floor(pMinV) - 1);
+                int px1 = Math.min(ts, (int) Math.ceil(pMaxU) + 1);
+                int py1 = Math.min(ts, (int) Math.ceil(pMaxV) + 1);
+                int escape = Math.max(Math.max(x0 - px0, px1 - x1), Math.max(y0 - py0, py1 - y1));
+                if (escape > 0)
+                {
+                    ShadowClipTelemetry.noteRectTight(id, escape);
+                }
+            }
+        }
+        return rect;
     }
 
     /** Small angular slack (radians) added to the spot cone test so a subject
@@ -2343,6 +2481,12 @@ public final class ShadowBaker
         }
         else
         {
+            // Pool full: either branch makes some caster vanish from ALL lights
+            // this frame — the rejected newcomer or the evicted farthest entry.
+            if (ShadowClipTelemetry.ENABLED)
+            {
+                ShadowClipTelemetry.notePoolDrop();
+            }
             if (d2 >= farthestOccDist2)
             {
                 return;
