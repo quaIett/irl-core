@@ -75,7 +75,7 @@ public final class ShadowBaker
     /** Static-layer membership, INDEPENDENT of {@link #occType} (seam INVARIANT 2).
      *  True => baked into the never-rebaked static base; its silhouette changes only
      *  when {@link #ostatichash} changes. False (every redactor caster — all dynamic
-     *  entities) => re-rendered every frame. */
+     *  entities) => live overlay; unknown revisions re-render every frame. */
     private static final boolean[] oStatic = new boolean[MAX_OCCLUDERS];
     /** Per-occluder signature of everything that changes a STATIC (model-block)
      *  caster's baked silhouette but isn't its center: form identity + transform
@@ -83,12 +83,22 @@ public final class ShadowBaker
      *  in range; unused (0) for entity/replay casters, which are always treated
      *  dirty. */
     private static final long[] ostatichash = new long[MAX_OCCLUDERS];
+    private static final CasterRevision[] oRevision = new CasterRevision[MAX_OCCLUDERS];
+    private static final ShadowOverlayCache spotOverlays = new ShadowOverlayCache();
+    private static final ShadowOverlayCache pointOverlays = new ShadowOverlayCache();
+    private static final ShadowOverlayCache.Members overlayMembers = new ShadowOverlayCache.Members();
+    /** References reused within one bake only; Member records never mutate. */
+    private static final ShadowOverlayCache.Member[] spotMembersBySlot =
+        new ShadowOverlayCache.Member[MAX_OCCLUDERS];
+    private static final boolean NO_OVERLAY_REUSE = Boolean.getBoolean("irlite.noOverlayReuse");
+    private static ClientWorld overlayWorld;
     /** Squared camera distance of each kept occluder's center — the
      *  replacement metric of the nearest-N policy (OPEN-2, see {@link #put}). */
     private static final float[] odist2 = new float[MAX_OCCLUDERS];
+    private static final FarthestCasterHeap farthestOccHeap = new FarthestCasterHeap(odist2);
     private static int occCount;
     /** Cached argmax of {@link #odist2}. Once the pool is full this makes the
-     *  common rejected-candidate path O(1); only accepted replacements rescan. */
+     *  common rejected-candidate path O(1); accepted replacements update a heap. */
     private static int farthestOccIdx;
     private static float farthestOccDist2;
 
@@ -396,10 +406,34 @@ public final class ShadowBaker
         }
     }
 
+    private static void probeDetailedSection(String name)
+    {
+        ShadowBakeProbe p = ShadowEngine.bakeProbe();
+        if (p != null && p.detailedTimings())
+        {
+            p.section(name);
+        }
+    }
+
     private ShadowBaker()
     {}
 
     public static void bake(ClientWorld world, Vec3d cameraPos, Vec3d cameraForward, float tickDelta)
+    {
+        try
+        {
+            bakeProfiled(world, cameraPos, cameraForward, tickDelta);
+        }
+        catch (RuntimeException | Error failure)
+        {
+            // Includes failures in the batched filters AFTER depth was written.
+            spotOverlays.clear();
+            pointOverlays.clear();
+            throw failure;
+        }
+    }
+
+    private static void bakeProfiled(ClientWorld world, Vec3d cameraPos, Vec3d cameraForward, float tickDelta)
     {
         if (!PROFILE)
         {
@@ -428,6 +462,11 @@ public final class ShadowBaker
 
     private static void bakeInner(ClientWorld world, Vec3d cameraPos, Vec3d cameraForward, float tickDelta)
     {
+        if (overlayWorld != world)
+        {
+            resetTileState();
+            overlayWorld = world;
+        }
         if (world == null || cameraPos == null)
         {
             return;
@@ -478,6 +517,11 @@ public final class ShadowBaker
 
         int n = LightRegistry.getCount();
         boolean cache = ShadowEngine.config().shadowCache();
+        if (!cache || NO_OVERLAY_REUSE)
+        {
+            spotOverlays.clear();
+            pointOverlays.clear();
+        }
         frameIndex++;
         // Per-frame full-static-bake budgets (T2.4 deferrable / C2 mandatory).
         // <= 0 means unlimited. The deferrable pool spans the whole frame; the
@@ -824,6 +868,16 @@ public final class ShadowBaker
                 continue;
             }
 
+            long overlayPolicy = overlayPolicy(lxD, lyD, lzD);
+            if (dyn && !NO_OVERLAY_REUSE && SpotShadowPyramid.readyForReuse() && SpotShadowEvsm.readyForReuse()
+                && staticBaseCurrent(id, sig, myTile, blocks, hasStatic)
+                && spotOverlays.reusable(id, myTile, sig, blocks, overlayPolicy, overlayMembers))
+            {
+                probeCount("sp.reuse", 1);
+                continue;
+            }
+            long overlayFailures = ShadowRenderer.casterFailures();
+
             // Overlay mode: a dynamic subject is in range (or just left). The
             // static base lives in the STATIC tile, re-baked only when it
             // changes; every frame it is GPU-copied into the live tile and only
@@ -899,6 +953,7 @@ public final class ShadowBaker
                 {
                     copyRect = ShadowRect.FULL;
                 }
+                probeDetailedSection("bake-spot-copy");
                 if (copyRect == ShadowRect.FULL)
                 {
                     SpotlightDepthAtlas.copyStaticToLive(myTile);
@@ -912,6 +967,7 @@ public final class ShadowBaker
                     probeCount("sp.rect", 1);
                 }
                 probeCount("sp.copy", 1);
+                probeDetailedSection("bake-spot");
                 if (dyn)
                 {
                     if (PROFILE)
@@ -972,8 +1028,11 @@ public final class ShadowBaker
                 // successful bake into myTile -> same release rule as above.
                 releaseOldTile(spotTileOwner, id, prevTile, myTile);
             }
-            // overlay mode rewrites live content every frame -> pyramid + EVSM
-            // follow every frame, on the same rect the copy/draws touched
+            spotOverlays.completed(id, myTile, sig, blocks, overlayPolicy, overlayMembers,
+                dyn && !NO_OVERLAY_REUSE && ShadowRenderer.casterFailures() == overlayFailures
+                    && staticBaseCurrent(id, sig, myTile, blocks, hasStatic));
+            // Changed overlays rebuild depth and its dependent filters together,
+            // on the same rect the copy/draws touched.
             if (filterRect == ShadowRect.FULL)
             {
                 SpotShadowPyramid.markDirty(myTile);
@@ -1260,6 +1319,19 @@ public final class ShadowBaker
                 continue;
             }
 
+            long overlayPolicy = overlayPolicy(lxD, lyD, lzD);
+            int overlayTier = tierForIndex(myBlock, POINT_TIER_END);
+            int overlayLocal = myBlock - PointDepthAtlas.tierStartBlock(overlayTier);
+            if (dyn && !NO_OVERLAY_REUSE && PointShadowPyramid.readyForReuse(overlayTier, overlayLocal)
+                && PointShadowEvsm.readyForReuse(overlayTier, overlayLocal)
+                && staticBaseCurrent(id, sig, myBlock, blocks, hasStatic)
+                && pointOverlays.reusable(id, myBlock, sig, blocks, overlayPolicy, overlayMembers))
+            {
+                probeCount("pt.reuse", 1);
+                continue;
+            }
+            long overlayFailures = ShadowRenderer.casterFailures();
+
             // Overlay mode (see the spot loop). The static base lives in the
             // STATIC atlas layer, re-baked only when it changes; each frame it
             // is GPU-copied into the live block and only the dynamic casters
@@ -1320,6 +1392,7 @@ public final class ShadowBaker
                 // including when a stale re-bake was DEFERRED (T2.4): the static
                 // layer is unchanged, so the live block's static faces still match.
                 int dynNow = dynFaceMaskScratch;
+                probeDetailedSection("bake-point-copy");
                 if (bakedStatic)
                 {
                     PointDepthAtlas.copyStaticToLive(myBlock);
@@ -1338,6 +1411,7 @@ public final class ShadowBaker
                     }
                 }
 
+                probeDetailedSection("bake-point");
                 if (dyn)
                 {
                     if (PROFILE)
@@ -1384,7 +1458,10 @@ public final class ShadowBaker
                 // successful bake into myBlock -> same release rule as above.
                 releaseOldTile(pointSlotOwner, id, prevTile, myBlock);
             }
-            // overlay mode rewrites live faces every frame (copies + dynamics) -> pyramid + EVSM follow every frame
+            pointOverlays.completed(id, myBlock, sig, blocks, overlayPolicy, overlayMembers,
+                dyn && !NO_OVERLAY_REUSE && ShadowRenderer.casterFailures() == overlayFailures
+                    && staticBaseCurrent(id, sig, myBlock, blocks, hasStatic));
+            // Changed point overlays still rebuild ALL dependent faces/mips/moments.
             PointShadowPyramid.markDirty(myBlock);
             PointShadowEvsm.markDirty(myBlock, radius);
 
@@ -1787,6 +1864,8 @@ public final class ShadowBaker
      *  light). */
     private static void purgeDirtyState(long id)
     {
+        spotOverlays.forget(id);
+        pointOverlays.forget(id);
         lastSig.remove(id);
         lastTile.remove(id);
         lastBlocks.remove(id);
@@ -1804,6 +1883,12 @@ public final class ShadowBaker
      *  first-bakes into a fresh tile. */
     private static void resetTileState()
     {
+        spotOverlays.clear();
+        pointOverlays.clear();
+        overlayMembers.clear();
+        Arrays.fill(occ, null);
+        Arrays.fill(oRevision, null);
+        Arrays.fill(spotMembersBySlot, null);
         Arrays.fill(spotTileOwner, NO_OWNER);
         Arrays.fill(pointSlotOwner, NO_OWNER);
         lastSig.clear();
@@ -1898,6 +1983,8 @@ public final class ShadowBaker
      *  drains it. */
     private static void retainDirtyState(LongSet keep)
     {
+        spotOverlays.retain(keep::contains);
+        pointOverlays.retain(keep::contains);
         if (!lastSig.isEmpty())
         {
             lastSig.keySet().retainAll(keep);
@@ -1994,6 +2081,7 @@ public final class ShadowBaker
     private static int scanInRange(float lx, float ly, float lz, float reachBase,
                                    float dirX, float dirY, float dirZ, float coneTheta, boolean cone)
     {
+        overlayMembers.clear(!NO_OVERLAY_REUSE && ShadowEngine.config().shadowCache());
         int sc = 0;
         int statics = 0;
         boolean dyn = false;
@@ -2106,6 +2194,16 @@ public final class ShadowBaker
             {
                 dyn = true; // entity or film replay -> dynamic subject
                 dynFaces |= faceMask; // per-face: which faces a dynamic caster reaches
+                if (cone)
+                {
+                    overlayMembers.addSpot(spotMembersBySlot, k, occ[k], occType[k], oRevision[k],
+                        ox[k], oy[k], oz[k], orad[k], orh[k], ohv[k]);
+                }
+                else
+                {
+                    overlayMembers.add(occ[k], occType[k], oRevision[k],
+                        ox[k], oy[k], oz[k], orad[k], orh[k], ohv[k], faceMask);
+                }
             }
         }
         shortCount = sc;
@@ -2451,9 +2549,8 @@ public final class ShadowBaker
     /** Insert one occluder into the bounded SoA — appends while there is room;
      *  when full, keeps the nearest {@link #MAX_OCCLUDERS} by camera distance: the current farthest
      *  kept entry (argmax {@link #odist2}) is replaced iff the newcomer is
-     *  nearer, else the newcomer is dropped. The argmax is cached, then rescanned
-     *  only after a replacement; downstream order is irrelevant
-     *  ({@link #scanInRange} iterates all entries). */
+     *  nearer, else the newcomer is dropped. A heap maintains the argmax after
+     *  replacements without moving the retained SoA slots or changing ties. */
     private static void put(Object caster, int type, boolean isStatic,
                             float cx, float cy, float cz, float radius,
                             float rh, float hv, long staticHash)
@@ -2516,18 +2613,10 @@ public final class ShadowBaker
             return;
         }
 
-        // Replaced the cached farthest entry. Strict '>' preserves the old
-        // first-maximum tie behaviour; an equally distant newcomer is rejected.
-        farthestOccIdx = 0;
-        farthestOccDist2 = odist2[0];
-        for (int k = 1; k < MAX_OCCLUDERS; k++)
-        {
-            if (odist2[k] > farthestOccDist2)
-            {
-                farthestOccIdx = k;
-                farthestOccDist2 = odist2[k];
-            }
-        }
+        // The heap compares distance, then smaller slot first, matching the
+        // previous strict-'>' rescan exactly. Equal newcomers still reject above.
+        farthestOccIdx = farthestOccHeap.afterReplace();
+        farthestOccDist2 = odist2[farthestOccIdx];
     }
 
     private static void collect(ClientWorld world, Vec3d cameraPos, float tickDelta)
@@ -2540,6 +2629,52 @@ public final class ShadowBaker
         occCount = 0;
         farthestOccIdx = 0;
         farthestOccDist2 = Float.NEGATIVE_INFINITY;
+        farthestOccHeap.reset();
+        Arrays.fill(spotMembersBySlot, null);
         ShadowEngine.source().collect(world, cameraPos, tickDelta, SINK);
+        for (int k = 0; k < occCount; k++)
+        {
+            CasterRevision revision = CasterRevision.UNKNOWN;
+            if (!oStatic[k] && !NO_OVERLAY_REUSE && ShadowEngine.config().shadowCache())
+            {
+                try
+                {
+                    revision = ShadowEngine.source().revision(occ[k], occType[k], tickDelta);
+                }
+                catch (RuntimeException | LinkageError unavailable)
+                {
+                    // Optional host capability failure changes cost, never correctness.
+                }
+            }
+            oRevision[k] = revision == null ? CasterRevision.UNKNOWN : revision;
+            if (!oStatic[k]) probeCount(oRevision[k].known() ? "caster.known" : "caster.unknown", 1);
+        }
+        Arrays.fill(occ, occCount, MAX_OCCLUDERS, null);
+        Arrays.fill(oRevision, occCount, MAX_OCCLUDERS, null);
+    }
+
+    private static boolean staticBaseCurrent(long id, long sig, int tile,
+                                             List<BlockShadowEntry> blocks, boolean hasStatic)
+    {
+        return !hasStatic || (lastStaticTile.containsKey(id) && lastStaticTile.get(id) == tile
+            && lastStaticSig.get(id) == sig && lastStaticBlocks.get(id) == blocks);
+    }
+
+    /** Filter-only recreation can discard derived content while keeping depth. */
+    public static void invalidateOverlays()
+    {
+        spotOverlays.clear();
+        pointOverlays.clear();
+    }
+
+    private static long overlayPolicy(double x, double y, double z)
+    {
+        // The renderer subtracts the DOUBLE light anchor. Preserve sub-float
+        // movement at distant world coordinates as well as live scissor settings.
+        long h = mix64(Double.doubleToLongBits(x));
+        h = mix64(h ^ Double.doubleToLongBits(y));
+        h = mix64(h ^ Double.doubleToLongBits(z));
+        h = mix64(h ^ Float.floatToIntBits(ShadowEngine.config().shadowPoseReach()));
+        return mix64(h ^ (ShadowEngine.config().shadowPartialTile() ? 1L : 0L));
     }
 }

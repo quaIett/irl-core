@@ -34,6 +34,14 @@ public interface ShadowCasterSource
      */
     void collect(ClientWorld world, Vec3d camPos, float tickDelta, OccluderSink sink);
 
+    /** Optional complete silhouette contract, sampled once for each kept dynamic
+     * caster after collect and before any draw. Unsupported poses, resource state,
+     * or view-dependent rendering MUST return UNKNOWN. Legacy hosts remain dirty. */
+    default CasterRevision revision(Object caster, int type, float tickDelta)
+    {
+        return CasterRevision.UNKNOWN;
+    }
+
     /**
      * HOW to draw ONE shortlisted caster for the current pass. The shared layer has
      * ALREADY set up the frame (FBO/viewport/scissor, light view onto the ambient

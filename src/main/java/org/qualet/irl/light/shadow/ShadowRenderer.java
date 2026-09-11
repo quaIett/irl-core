@@ -110,6 +110,11 @@ public final class ShadowRenderer
      *  (the render thread is single-threaded, so one instance is safe). */
     private static final ImmediateOccluderBatch casterBatch = new ImmediateOccluderBatch();
 
+    private static long casterFailures;
+
+    /** Monotonic failure stamp: a recovered partial draw must never be cached. */
+    public static long casterFailures() { return casterFailures; }
+
     private ShadowRenderer()
     {}
 
@@ -351,6 +356,7 @@ public final class ShadowRenderer
         }
         catch (Throwable t)
         {
+            casterFailures++;
             // The caster threw mid-build: terminate its run now (drain the batch,
             // re-asserting the light matrices) so its partial geometry ends here
             // instead of merging into the next caster's quads.
@@ -394,6 +400,7 @@ public final class ShadowRenderer
         }
         catch (Throwable t)
         {
+            casterFailures++;
             // swallow — a broken buffer must not abort the whole bake
         }
     }
@@ -426,6 +433,7 @@ public final class ShadowRenderer
     // 6 cube faces (point) / the single atlas tile (spot). Static lamps
     // re-upload nothing. Evicted by retainBlockVbos when the lamp disappears.
     private static final Long2ObjectOpenHashMap<VertexBuffer> blockVboById = new Long2ObjectOpenHashMap<>();
+    // A matching list with a null VBO caches "no shaped entries" as well.
     private static final Long2ObjectOpenHashMap<List<BlockShadowEntry>> blockVboListById = new Long2ObjectOpenHashMap<>();
 
     // --- Per-light cutout block VBO cache (T2.3), keyed by LightRegistry.id ---
@@ -452,6 +460,7 @@ public final class ShadowRenderer
     }
 
     private static final Long2ObjectOpenHashMap<CutoutVbos> cutoutVboById = new Long2ObjectOpenHashMap<>();
+    // A matching list with null VBOs caches "no cutout entries" as well.
     private static final Long2ObjectOpenHashMap<List<BlockShadowEntry>> cutoutVboListById = new Long2ObjectOpenHashMap<>();
 
     /**
@@ -471,19 +480,32 @@ public final class ShadowRenderer
         // Cutout blocks first (their own textured pass), then opaque AABBs.
         renderBlocksDepthCutout(id, blocks);
 
-        boolean anyShape = false;
-        for (int i = 0, n = blocks.size(); i < n; i++)
+        VertexBuffer vb = blockVboById.get(id);
+        boolean sameBlocks = blockVboListById.get(id) == blocks;
+        if (!sameBlocks)
         {
-            BlockShadowEntry e = blocks.get(i);
-            if (e != null && e.shape != null)
+            boolean anyShape = false;
+            for (int i = 0, n = blocks.size(); i < n; i++)
             {
-                anyShape = true;
-                break;
+                BlockShadowEntry e = blocks.get(i);
+                if (e != null && e.shape != null)
+                {
+                    anyShape = true;
+                    break;
+                }
+            }
+            if (!anyShape)
+            {
+                // Cache the absence too: point faces must not rescan a cutout-
+                // only list six times. Keep a map entry so normal eviction owns it.
+                releaseBlockVbo(id);
+                blockVboById.put(id, null);
+                blockVboListById.put(id, blocks);
+                return;
             }
         }
-        if (!anyShape)
+        else if (vb == null)
         {
-            // All entries were cutout — begin/end on an empty buffer would throw.
             return;
         }
 
@@ -503,8 +525,7 @@ public final class ShadowRenderer
 
             // Rebuild only when the list instance changed (BlockShadowCache
             // returns the same instance on a hit) — static lamps just redraw.
-            VertexBuffer vb = blockVboById.get(id);
-            if (vb == null || blockVboListById.get(id) != blocks)
+            if (!sameBlocks)
             {
                 if (vb != null)
                 {
@@ -665,17 +686,29 @@ public final class ShadowRenderer
             return;
         }
 
-        boolean any = false;
-        for (int i = 0, n = blocks.size(); i < n; i++)
+        CutoutVbos vbos = cutoutVboById.get(id);
+        boolean sameBlocks = cutoutVboListById.get(id) == blocks;
+        if (!sameBlocks)
         {
-            BlockShadowEntry e = blocks.get(i);
-            if (e != null && e.cutout)
+            boolean any = false;
+            for (int i = 0, n = blocks.size(); i < n; i++)
             {
-                any = true;
-                break;
+                BlockShadowEntry e = blocks.get(i);
+                if (e != null && e.cutout)
+                {
+                    any = true;
+                    break;
+                }
+            }
+            if (!any)
+            {
+                releaseCutoutVbos(id);
+                cutoutVboById.put(id, null);
+                cutoutVboListById.put(id, blocks);
+                return;
             }
         }
-        if (!any)
+        else if (vbos == null)
         {
             return;
         }
@@ -684,8 +717,7 @@ public final class ShadowRenderer
         // / the single atlas tile and across static bakes while the list is
         // stable (BlockShadowCache returns the same instance until a block in
         // range changes), so a static lamp re-tessellates nothing.
-        CutoutVbos vbos = cutoutVboById.get(id);
-        if (vbos == null || cutoutVboListById.get(id) != blocks)
+        if (!sameBlocks)
         {
             if (vbos != null)
             {

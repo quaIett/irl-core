@@ -180,9 +180,8 @@ public final class VlGlobalsBuffer
 
         frameIndex = (frameIndex + 1) & 4095;   // one tick per upload = per frame
 
-        GL15.glBindBuffer(GL31.GL_UNIFORM_BUFFER, ubo);
-        GL15.glBufferSubData(GL31.GL_UNIFORM_BUFFER, 0L, scratch);
         GL30.glBindBufferBase(GL31.GL_UNIFORM_BUFFER, BINDING, ubo);
+        GL15.glBufferSubData(GL31.GL_UNIFORM_BUFFER, 0L, scratch);
         GL15.glBindBuffer(GL31.GL_UNIFORM_BUFFER, 0);
     }
 

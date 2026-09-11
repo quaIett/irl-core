@@ -56,6 +56,9 @@ public final class IrlSamplers
     }
 
     private static final Map<String, Entry> SAMPLERS = new LinkedHashMap<>();
+    // Rebuilt only on registration. The per-texture Iris bind hook can scan
+    // array-backed suppliers without a map iterator, lambda or temporary holder.
+    private static Entry[] arraySamplers = new Entry[0];
 
     static
     {
@@ -104,6 +107,9 @@ public final class IrlSamplers
     public static void register(String name, IntSupplier glId, int glTarget)
     {
         SAMPLERS.put(name, new Entry(glId, glTarget));
+        arraySamplers = SAMPLERS.values().stream()
+            .filter(entry -> entry.glTarget != GL11.GL_TEXTURE_2D)
+            .toArray(Entry[]::new);
     }
 
     /** Visits every registered sampler in registration order. */
@@ -124,5 +130,24 @@ public final class IrlSamplers
     {
         Entry entry = SAMPLERS.get(name);
         return entry != null ? entry.glTarget : GL11.GL_TEXTURE_2D;
+    }
+
+    /** True target for a live array texture id, or 2D for zero/unknown ids.
+     *  Suppliers stay live: atlas deletion/recreation can change ids between binds.
+     *  Plain 2D suppliers are never evaluated by this lookup (some initialize GL
+     *  textures lazily). Registration replacement preserves insertion precedence. */
+    public static int glTargetForTexture(int textureId)
+    {
+        if (textureId != 0)
+        {
+            for (Entry entry : arraySamplers)
+            {
+                if (entry.glId.getAsInt() == textureId)
+                {
+                    return entry.glTarget;
+                }
+            }
+        }
+        return GL11.GL_TEXTURE_2D;
     }
 }

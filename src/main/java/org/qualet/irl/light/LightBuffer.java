@@ -149,9 +149,9 @@ public final class LightBuffer
         scratch.position(0);
         scratch.limit(used);
 
-        GL15.glBindBuffer(GL43.GL_SHADER_STORAGE_BUFFER, ssbo);
-        GL15.glBufferSubData(GL43.GL_SHADER_STORAGE_BUFFER, 0L, scratch);
+        // BindBufferBase also sets the generic target used by BufferSubData.
         GL30.glBindBufferBase(GL43.GL_SHADER_STORAGE_BUFFER, BINDING, ssbo);
+        GL15.glBufferSubData(GL43.GL_SHADER_STORAGE_BUFFER, 0L, scratch);
         GL15.glBindBuffer(GL43.GL_SHADER_STORAGE_BUFFER, 0);
 
         scratch.clear();
