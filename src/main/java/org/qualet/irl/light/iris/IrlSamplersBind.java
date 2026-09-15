@@ -48,25 +48,12 @@ public final class IrlSamplersBind
      */
     public static boolean tryRebind(int boundId, int textureUnit)
     {
-        if (boundId == 0)
+        int glTarget = IrlSamplers.glTargetForTexture(boundId);
+        if (glTarget == GL11.GL_TEXTURE_2D)
         {
             return false;
         }
-
-        boolean[] matched = {false};
-        IrlSamplers.forEach((name, glId, glTarget) ->
-        {
-            if (matched[0] || glTarget == GL11.GL_TEXTURE_2D)
-            {
-                return;
-            }
-            int id = glId.getAsInt();
-            if (id != 0 && id == boundId)
-            {
-                IrisRenderSystem.bindTextureToUnit(glTarget, textureUnit, boundId);
-                matched[0] = true;
-            }
-        });
-        return matched[0];
+        IrisRenderSystem.bindTextureToUnit(glTarget, textureUnit, boundId);
+        return true;
     }
 }

@@ -1,0 +1,3 @@
+        occCount = 0;
+        farthestOccIdx = 0;
+        farthestOccDist2 = Float.NEGATIVE_INFINITY;

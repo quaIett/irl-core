@@ -98,6 +98,8 @@ public final class SpotShadowPyramid
         return texId;
     }
 
+    static boolean readyForReuse() { return texId != 0 && program != 0; }
+
     /** Mark one tile's pyramid region stale. Call after every bake pass (or
      *  static->live copy + overlay) that changed the tile's live depth. */
     public static void markDirty(int tile)
@@ -365,6 +367,7 @@ public final class SpotShadowPyramid
      *  future bind when the driver reuses the name). */
     public static void delete()
     {
+        ShadowBaker.invalidateOverlays();
         if (texId != 0)
         {
             GlStateManager._deleteTexture(texId);

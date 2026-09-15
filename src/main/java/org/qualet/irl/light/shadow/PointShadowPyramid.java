@@ -277,6 +277,11 @@ public final class PointShadowPyramid
         return capBlocks[t];
     }
 
+    static boolean readyForReuse(int tier, int local)
+    {
+        return capBlocks[tier] > local && texId[tier] != 0 && progCube != 0 && progMip != 0;
+    }
+
     /** True when the compute programs failed to build — this filter will
      *  never allocate or dispatch, so it must not constrain the budget. */
     static boolean inert()
@@ -453,6 +458,7 @@ public final class PointShadowPyramid
      *  delete is safe here (unlike the 2D spot pyramid). */
     public static void delete()
     {
+        ShadowBaker.invalidateOverlays();
         for (int t = 0; t < 3; t++)
         {
             if (texId[t] != 0)

@@ -75,7 +75,7 @@ public final class ShadowBaker
     /** Static-layer membership, INDEPENDENT of {@link #occType} (seam INVARIANT 2).
      *  True => baked into the never-rebaked static base; its silhouette changes only
      *  when {@link #ostatichash} changes. False (every redactor caster — all dynamic
-     *  entities) => re-rendered every frame. */
+     *  entities) => live overlay; unknown revisions re-render every frame. */
     private static final boolean[] oStatic = new boolean[MAX_OCCLUDERS];
     /** Per-occluder signature of everything that changes a STATIC (model-block)
      *  caster's baked silhouette but isn't its center: form identity + transform
@@ -83,12 +83,22 @@ public final class ShadowBaker
      *  in range; unused (0) for entity/replay casters, which are always treated
      *  dirty. */
     private static final long[] ostatichash = new long[MAX_OCCLUDERS];
+    private static final CasterRevision[] oRevision = new CasterRevision[MAX_OCCLUDERS];
+    private static final ShadowOverlayCache spotOverlays = new ShadowOverlayCache();
+    private static final ShadowOverlayCache pointOverlays = new ShadowOverlayCache();
+    private static final ShadowOverlayCache.Members overlayMembers = new ShadowOverlayCache.Members();
+    /** References reused within one bake only; Member records never mutate. */
+    private static final ShadowOverlayCache.Member[] spotMembersBySlot =
+        new ShadowOverlayCache.Member[MAX_OCCLUDERS];
+    private static final boolean NO_OVERLAY_REUSE = Boolean.getBoolean("irlite.noOverlayReuse");
+    private static ClientWorld overlayWorld;
     /** Squared camera distance of each kept occluder's center — the
      *  replacement metric of the nearest-N policy (OPEN-2, see {@link #put}). */
     private static final float[] odist2 = new float[MAX_OCCLUDERS];
+    private static final FarthestCasterHeap farthestOccHeap = new FarthestCasterHeap(odist2);
     private static int occCount;
     /** Cached argmax of {@link #odist2}. Once the pool is full this makes the
-     *  common rejected-candidate path O(1); only accepted replacements rescan. */
+     *  common rejected-candidate path O(1); accepted replacements update a heap. */
     private static int farthestOccIdx;
     private static float farthestOccDist2;
 
@@ -149,7 +159,9 @@ public final class ShadowBaker
     private static final Long2LongOpenHashMap lastDynRect = new Long2LongOpenHashMap();
 
     /** Kill switch for the partial-tile spot overlay (copy/scissor/filter
-     *  rects): -Dirlite.noPartialFilter=true restores the full-tile paths. */
+     *  rects): -Dirlite.noPartialFilter=true restores the full-tile paths.
+     *  The per-mod LIVE toggle is {@link ShadowConfig#shadowPartialTile()},
+     *  checked next to this flag at the single overlay gate. */
     private static final boolean NO_PARTIAL = Boolean.getBoolean("irlite.noPartialFilter");
 
     /** Diagnostic bisect of the partial-tile path
@@ -394,14 +406,42 @@ public final class ShadowBaker
         }
     }
 
+    private static void probeDetailedSection(String name)
+    {
+        ShadowBakeProbe p = ShadowEngine.bakeProbe();
+        if (p != null && p.detailedTimings())
+        {
+            p.section(name);
+        }
+    }
+
     private ShadowBaker()
     {}
 
     public static void bake(ClientWorld world, Vec3d cameraPos, Vec3d cameraForward, float tickDelta)
     {
+        try
+        {
+            bakeProfiled(world, cameraPos, cameraForward, tickDelta);
+        }
+        catch (RuntimeException | Error failure)
+        {
+            // Includes failures in the batched filters AFTER depth was written.
+            spotOverlays.clear();
+            pointOverlays.clear();
+            throw failure;
+        }
+    }
+
+    private static void bakeProfiled(ClientWorld world, Vec3d cameraPos, Vec3d cameraForward, float tickDelta)
+    {
         if (!PROFILE)
         {
             bakeInner(world, cameraPos, cameraForward, tickDelta);
+            if (ShadowClipTelemetry.ENABLED)
+            {
+                ShadowClipTelemetry.recordFrame();
+            }
             return;
         }
 
@@ -413,11 +453,20 @@ public final class ShadowBaker
         finally
         {
             profRecordFrame(System.nanoTime() - t0);
+            if (ShadowClipTelemetry.ENABLED)
+            {
+                ShadowClipTelemetry.recordFrame();
+            }
         }
     }
 
     private static void bakeInner(ClientWorld world, Vec3d cameraPos, Vec3d cameraForward, float tickDelta)
     {
+        if (overlayWorld != world)
+        {
+            resetTileState();
+            overlayWorld = world;
+        }
         if (world == null || cameraPos == null)
         {
             return;
@@ -468,6 +517,11 @@ public final class ShadowBaker
 
         int n = LightRegistry.getCount();
         boolean cache = ShadowEngine.config().shadowCache();
+        if (!cache || NO_OVERLAY_REUSE)
+        {
+            spotOverlays.clear();
+            pointOverlays.clear();
+        }
         frameIndex++;
         // Per-frame full-static-bake budgets (T2.4 deferrable / C2 mandatory).
         // <= 0 means unlimited. The deferrable pool spans the whole frame; the
@@ -559,6 +613,10 @@ public final class ShadowBaker
             // at all — neither entities nor world blocks. Forcing both inputs
             // empty drops it into the same "nothing in range" skip below, leaving
             // its shadow tile unassigned (-1 = none in the SSBO -> unshadowed).
+            if (ShadowClipTelemetry.ENABLED)
+            {
+                ShadowClipTelemetry.beginScan(id, true);
+            }
             int entInRange = castsShadows ? scanInRange(lx, ly, lz, range, ndx, ndy, ndz, coneTheta, cone) : 0;
             // Collect blocks every frame (NOT gated on dirty): the skip/tile
             // decision must match the frame that actually baked, or the atlas
@@ -810,6 +868,16 @@ public final class ShadowBaker
                 continue;
             }
 
+            long overlayPolicy = overlayPolicy(lxD, lyD, lzD);
+            if (dyn && !NO_OVERLAY_REUSE && SpotShadowPyramid.readyForReuse() && SpotShadowEvsm.readyForReuse()
+                && staticBaseCurrent(id, sig, myTile, blocks, hasStatic)
+                && spotOverlays.reusable(id, myTile, sig, blocks, overlayPolicy, overlayMembers))
+            {
+                probeCount("sp.reuse", 1);
+                continue;
+            }
+            long overlayFailures = ShadowRenderer.casterFailures();
+
             // Overlay mode: a dynamic subject is in range (or just left). The
             // static base lives in the STATIC tile, re-baked only when it
             // changes; every frame it is GPU-copied into the live tile and only
@@ -874,10 +942,10 @@ public final class ShadowBaker
                 // invalidates the whole tile's filtered content -> FULL.
                 int ts = SpotlightDepthAtlas.tileSizePx(myTile);
                 long dynRect = ShadowRect.FULL;
-                if (!NO_PARTIAL && dyn && !bakedStatic)
+                if (!NO_PARTIAL && ShadowEngine.config().shadowPartialTile() && dyn && !bakedStatic)
                 {
                     dynRect = computeSpotDynRect(lx, ly, lz, lxD, lyD, lzD,
-                        ndx, ndy, ndz, cone, range, outerDeg, ts);
+                        ndx, ndy, ndz, cone, range, outerDeg, ts, id);
                 }
                 long copyRect = (bakedStatic || PARTIAL_FULL_FILTERS) ? ShadowRect.FULL
                     : ShadowRect.union(dynRect, lastDynRect.containsKey(id) ? lastDynRect.get(id) : ShadowRect.FULL);
@@ -885,6 +953,7 @@ public final class ShadowBaker
                 {
                     copyRect = ShadowRect.FULL;
                 }
+                probeDetailedSection("bake-spot-copy");
                 if (copyRect == ShadowRect.FULL)
                 {
                     SpotlightDepthAtlas.copyStaticToLive(myTile);
@@ -898,6 +967,7 @@ public final class ShadowBaker
                     probeCount("sp.rect", 1);
                 }
                 probeCount("sp.copy", 1);
+                probeDetailedSection("bake-spot");
                 if (dyn)
                 {
                     if (PROFILE)
@@ -958,8 +1028,11 @@ public final class ShadowBaker
                 // successful bake into myTile -> same release rule as above.
                 releaseOldTile(spotTileOwner, id, prevTile, myTile);
             }
-            // overlay mode rewrites live content every frame -> pyramid + EVSM
-            // follow every frame, on the same rect the copy/draws touched
+            spotOverlays.completed(id, myTile, sig, blocks, overlayPolicy, overlayMembers,
+                dyn && !NO_OVERLAY_REUSE && ShadowRenderer.casterFailures() == overlayFailures
+                    && staticBaseCurrent(id, sig, myTile, blocks, hasStatic));
+            // Changed overlays rebuild depth and its dependent filters together,
+            // on the same rect the copy/draws touched.
             if (filterRect == ShadowRect.FULL)
             {
                 SpotShadowPyramid.markDirty(myTile);
@@ -1040,6 +1113,10 @@ public final class ShadowBaker
             // See the spot loop: "Shadows" off -> no entities, no blocks.
             // Points are omnidirectional -> no cone cull (cone=false); the 6 cube
             // faces are culled individually in renderInRangeFace below.
+            if (ShadowClipTelemetry.ENABLED)
+            {
+                ShadowClipTelemetry.beginScan(id, false);
+            }
             int entInRange = castsShadows ? scanInRange(lx, ly, lz, radius, 0f, 0f, 0f, 0f, false) : 0;
             // Collected once, reused across all 6 cube faces (see spot note);
             // behind lights skip the collect when entInRange already decides
@@ -1242,6 +1319,19 @@ public final class ShadowBaker
                 continue;
             }
 
+            long overlayPolicy = overlayPolicy(lxD, lyD, lzD);
+            int overlayTier = tierForIndex(myBlock, POINT_TIER_END);
+            int overlayLocal = myBlock - PointDepthAtlas.tierStartBlock(overlayTier);
+            if (dyn && !NO_OVERLAY_REUSE && PointShadowPyramid.readyForReuse(overlayTier, overlayLocal)
+                && PointShadowEvsm.readyForReuse(overlayTier, overlayLocal)
+                && staticBaseCurrent(id, sig, myBlock, blocks, hasStatic)
+                && pointOverlays.reusable(id, myBlock, sig, blocks, overlayPolicy, overlayMembers))
+            {
+                probeCount("pt.reuse", 1);
+                continue;
+            }
+            long overlayFailures = ShadowRenderer.casterFailures();
+
             // Overlay mode (see the spot loop). The static base lives in the
             // STATIC atlas layer, re-baked only when it changes; each frame it
             // is GPU-copied into the live block and only the dynamic casters
@@ -1302,6 +1392,7 @@ public final class ShadowBaker
                 // including when a stale re-bake was DEFERRED (T2.4): the static
                 // layer is unchanged, so the live block's static faces still match.
                 int dynNow = dynFaceMaskScratch;
+                probeDetailedSection("bake-point-copy");
                 if (bakedStatic)
                 {
                     PointDepthAtlas.copyStaticToLive(myBlock);
@@ -1320,6 +1411,7 @@ public final class ShadowBaker
                     }
                 }
 
+                probeDetailedSection("bake-point");
                 if (dyn)
                 {
                     if (PROFILE)
@@ -1366,7 +1458,10 @@ public final class ShadowBaker
                 // successful bake into myBlock -> same release rule as above.
                 releaseOldTile(pointSlotOwner, id, prevTile, myBlock);
             }
-            // overlay mode rewrites live faces every frame (copies + dynamics) -> pyramid + EVSM follow every frame
+            pointOverlays.completed(id, myBlock, sig, blocks, overlayPolicy, overlayMembers,
+                dyn && !NO_OVERLAY_REUSE && ShadowRenderer.casterFailures() == overlayFailures
+                    && staticBaseCurrent(id, sig, myBlock, blocks, hasStatic));
+            // Changed point overlays still rebuild ALL dependent faces/mips/moments.
             PointShadowPyramid.markDirty(myBlock);
             PointShadowEvsm.markDirty(myBlock, radius);
 
@@ -1769,6 +1864,8 @@ public final class ShadowBaker
      *  light). */
     private static void purgeDirtyState(long id)
     {
+        spotOverlays.forget(id);
+        pointOverlays.forget(id);
         lastSig.remove(id);
         lastTile.remove(id);
         lastBlocks.remove(id);
@@ -1786,6 +1883,12 @@ public final class ShadowBaker
      *  first-bakes into a fresh tile. */
     private static void resetTileState()
     {
+        spotOverlays.clear();
+        pointOverlays.clear();
+        overlayMembers.clear();
+        Arrays.fill(occ, null);
+        Arrays.fill(oRevision, null);
+        Arrays.fill(spotMembersBySlot, null);
         Arrays.fill(spotTileOwner, NO_OWNER);
         Arrays.fill(pointSlotOwner, NO_OWNER);
         lastSig.clear();
@@ -1881,6 +1984,8 @@ public final class ShadowBaker
      *  drains it. */
     private static void retainDirtyState(LongSet keep)
     {
+        spotOverlays.retain(keep::contains);
+        pointOverlays.retain(keep::contains);
         if (!lastSig.isEmpty())
         {
             lastSig.keySet().retainAll(keep);
@@ -1977,6 +2082,7 @@ public final class ShadowBaker
     private static int scanInRange(float lx, float ly, float lz, float reachBase,
                                    float dirX, float dirY, float dirZ, float coneTheta, boolean cone)
     {
+        overlayMembers.clear(!NO_OVERLAY_REUSE && ShadowEngine.config().shadowCache());
         int sc = 0;
         int statics = 0;
         boolean dyn = false;
@@ -1986,13 +2092,52 @@ public final class ShadowBaker
         {
             float ddx = ox[k] - lx, ddy = oy[k] - ly, ddz = oz[k] - lz;
             float reach = reachBase + orad[k];
-            if (ddx * ddx + ddy * ddy + ddz * ddz > reach * reach)
+            float d2c = ddx * ddx + ddy * ddy + ddz * ddz;
+            if (d2c > reach * reach)
             {
+                if (ShadowClipTelemetry.ENABLED)
+                {
+                    // Probe: a sphere honest up to xMUL+ADD would have passed ->
+                    // potential whole-shadow vanish at the range boundary.
+                    float probeReach = reachBase
+                        + orad[k] * ShadowClipTelemetry.PROBE_MUL + ShadowClipTelemetry.PROBE_ADD;
+                    if (d2c <= probeReach * probeReach)
+                    {
+                        ShadowClipTelemetry.noteRangeMiss(occType[k], ox[k], oy[k], oz[k],
+                            (float) Math.sqrt(d2c) - reach);
+                    }
+                }
                 continue;
             }
             if (cone && !insideCone(dirX, dirY, dirZ, coneTheta, ddx, ddy, ddz, orad[k]))
             {
+                if (ShadowClipTelemetry.ENABLED
+                    && insideCone(dirX, dirY, dirZ, coneTheta, ddx, ddy, ddz,
+                        orad[k] * ShadowClipTelemetry.PROBE_MUL + ShadowClipTelemetry.PROBE_ADD))
+                {
+                    // Probe flips the cone verdict -> potential vanish at the cone edge.
+                    ShadowClipTelemetry.noteConeMiss(occType[k], ox[k], oy[k], oz[k]);
+                }
                 continue;
+            }
+            if (ShadowClipTelemetry.ENABLED)
+            {
+                // Declared sphere already crosses the bake far plane (= reachBase):
+                // the caster's far side is range-clipped even with an honest sphere.
+                // The far cut is AXIAL view-depth, not radial distance — spot views
+                // look along the cone axis, point faces along each face axis (the
+                // dominant component bounds all touched faces) — so measure the
+                // matching axial depth or casters near the radial boundary would
+                // report phantom far-crossings. (A degenerate-dir spot scans with
+                // cone=false and gets the point-style bound; telemetry-only.)
+                float axial = cone
+                    ? ddx * dirX + ddy * dirY + ddz * dirZ
+                    : Math.max(Math.abs(ddx), Math.max(Math.abs(ddy), Math.abs(ddz)));
+                float overhang = axial + orad[k] - reachBase;
+                if (overhang > 0f)
+                {
+                    ShadowClipTelemetry.noteFarCross(occType[k], ox[k], oy[k], oz[k], overhang);
+                }
             }
             // Passed range (+ cone for spots): shortlist it so the render passes
             // re-use this verdict instead of re-testing. For POINT scans
@@ -2008,6 +2153,29 @@ public final class ShadowBaker
                     if (sphereTouchesFace(face, ddx, ddy, ddz, kr))
                     {
                         faceMask |= 1 << face;
+                    }
+                }
+                if (ShadowClipTelemetry.ENABLED)
+                {
+                    float pkr = (orad[k] * ShadowClipTelemetry.PROBE_MUL
+                        + ShadowClipTelemetry.PROBE_ADD) * SQRT2;
+                    int probeMask = 0;
+                    for (int face = 0; face < 6; face++)
+                    {
+                        if (sphereTouchesFace(face, ddx, ddy, ddz, pkr))
+                        {
+                            probeMask |= 1 << face;
+                        }
+                    }
+                    int missingFaces = probeMask & ~faceMask;
+                    if (missingFaces != 0)
+                    {
+                        // Probe reaches faces the declared sphere is not drawn
+                        // into -> potential razor cut along a cube-face seam.
+                        // Gained-faces only: a sub-1 clipProbeMul (shrinking
+                        // probe) must go silent, not count lost faces.
+                        ShadowClipTelemetry.noteFaceMiss(occType[k], ox[k], oy[k], oz[k],
+                            missingFaces);
                     }
                 }
             }
@@ -2027,6 +2195,16 @@ public final class ShadowBaker
             {
                 dyn = true; // entity or film replay -> dynamic subject
                 dynFaces |= faceMask; // per-face: which faces a dynamic caster reaches
+                if (cone)
+                {
+                    overlayMembers.addSpot(spotMembersBySlot, k, occ[k], occType[k], oRevision[k],
+                        ox[k], oy[k], oz[k], orad[k], orh[k], ohv[k]);
+                }
+                else
+                {
+                    overlayMembers.add(occ[k], occType[k], oRevision[k],
+                        ox[k], oy[k], oz[k], orad[k], orh[k], ohv[k], faceMask);
+                }
             }
         }
         shortCount = sc;
@@ -2124,12 +2302,13 @@ public final class ShadowBaker
      * knob must be able to outgrow the hitbox's cull sphere in any
      * direction. The scissor set from this rect is the HARD bound for those
      * writes, so an under-estimate degrades to visible silhouette clipping,
-     * never to the filters missing fresh depth.
+     * never to the filters missing fresh depth. {@code id} is the light id,
+     * consumed only by the clip telemetry ({@link ShadowClipTelemetry}).
      */
     private static long computeSpotDynRect(float lx, float ly, float lz,
                                            double lxD, double lyD, double lzD,
                                            float ndx, float ndy, float ndz, boolean validDir,
-                                           float range, float outerDeg, int ts)
+                                           float range, float outerDeg, int ts, long id)
     {
         if (!validDir)
         {
@@ -2164,6 +2343,10 @@ public final class ShadowBaker
         float minU = Float.POSITIVE_INFINITY, minV = Float.POSITIVE_INFINITY;
         float maxU = Float.NEGATIVE_INFINITY, maxV = Float.NEGATIVE_INFINITY;
         boolean any = false;
+        // Telemetry probe union (inflated extents); bail mirrors the near-plane rule.
+        float pMinU = Float.POSITIVE_INFINITY, pMinV = Float.POSITIVE_INFINITY;
+        float pMaxU = Float.NEGATIVE_INFINITY, pMaxV = Float.NEGATIVE_INFINITY;
+        boolean probeBailed = false;
         for (int s = 0; s < shortCount; s++)
         {
             int k = shortIdx[s];
@@ -2203,6 +2386,34 @@ public final class ShadowBaker
                 maxU = Math.max(maxU, u);
                 maxV = Math.max(maxV, v);
             }
+            if (ShadowClipTelemetry.ENABLED && !probeBailed)
+            {
+                // Same projection with probe-inflated extents: if the probe rect
+                // outgrows the armed rect, geometry that much past the hitbox is
+                // being scissored (the documented silhouette-clip failure mode).
+                float phh = orh[k] * ShadowClipTelemetry.PROBE_MUL + ShadowClipTelemetry.PROBE_ADD + slack;
+                float phy = ohv[k] * ShadowClipTelemetry.PROBE_MUL + ShadowClipTelemetry.PROBE_ADD + slack;
+                for (int corner = 0; corner < 8; corner++)
+                {
+                    dynRectVec.set(
+                        cx + (((corner & 1) == 0) ? -phh : phh),
+                        cy + (((corner & 2) == 0) ? -phy : phy),
+                        cz + (((corner & 4) == 0) ? -phh : phh),
+                        1f);
+                    dynRectMatrix.transform(dynRectVec);
+                    if (dynRectVec.w < 0.05f)
+                    {
+                        probeBailed = true;
+                        break;
+                    }
+                    float pu = (dynRectVec.x / dynRectVec.w * 0.5f + 0.5f) * ts;
+                    float pv = (dynRectVec.y / dynRectVec.w * 0.5f + 0.5f) * ts;
+                    pMinU = Math.min(pMinU, pu);
+                    pMinV = Math.min(pMinV, pv);
+                    pMaxU = Math.max(pMaxU, pu);
+                    pMaxV = Math.max(pMaxV, pv);
+                }
+            }
         }
         if (!any)
         {
@@ -2218,7 +2429,32 @@ public final class ShadowBaker
             return ShadowRect.FULL; // fully off-tile after clamp — shouldn't happen for cone-culled casters
         }
         long rect = ShadowRect.pack(x0, y0, x1, y1);
-        return ShadowRect.coversMost(rect, ts, COVERS_MOST_NUM, COVERS_MOST_DEN) ? ShadowRect.FULL : rect;
+        if (ShadowRect.coversMost(rect, ts, COVERS_MOST_NUM, COVERS_MOST_DEN))
+        {
+            return ShadowRect.FULL;
+        }
+        if (ShadowClipTelemetry.ENABLED)
+        {
+            if (probeBailed)
+            {
+                // Probe corner at/behind the near plane while the armed rect is
+                // partial: report a full-tile-magnitude escape.
+                ShadowClipTelemetry.noteRectTight(id, ts);
+            }
+            else
+            {
+                int px0 = Math.max(0, (int) Math.floor(pMinU) - 1);
+                int py0 = Math.max(0, (int) Math.floor(pMinV) - 1);
+                int px1 = Math.min(ts, (int) Math.ceil(pMaxU) + 1);
+                int py1 = Math.min(ts, (int) Math.ceil(pMaxV) + 1);
+                int escape = Math.max(Math.max(x0 - px0, px1 - x1), Math.max(y0 - py0, py1 - y1));
+                if (escape > 0)
+                {
+                    ShadowClipTelemetry.noteRectTight(id, escape);
+                }
+            }
+        }
+        return rect;
     }
 
     /** Small angular slack (radians) added to the spot cone test so a subject
@@ -2314,9 +2550,8 @@ public final class ShadowBaker
     /** Insert one occluder into the bounded SoA — appends while there is room;
      *  when full, keeps the nearest {@link #MAX_OCCLUDERS} by camera distance: the current farthest
      *  kept entry (argmax {@link #odist2}) is replaced iff the newcomer is
-     *  nearer, else the newcomer is dropped. The argmax is cached, then rescanned
-     *  only after a replacement; downstream order is irrelevant
-     *  ({@link #scanInRange} iterates all entries). */
+     *  nearer, else the newcomer is dropped. A heap maintains the argmax after
+     *  replacements without moving the retained SoA slots or changing ties. */
     private static void put(Object caster, int type, boolean isStatic,
                             float cx, float cy, float cz, float radius,
                             float rh, float hv, long staticHash)
@@ -2344,6 +2579,12 @@ public final class ShadowBaker
         }
         else
         {
+            // Pool full: either branch makes some caster vanish from ALL lights
+            // this frame — the rejected newcomer or the evicted farthest entry.
+            if (ShadowClipTelemetry.ENABLED)
+            {
+                ShadowClipTelemetry.notePoolDrop();
+            }
             if (d2 >= farthestOccDist2)
             {
                 return;
@@ -2373,18 +2614,10 @@ public final class ShadowBaker
             return;
         }
 
-        // Replaced the cached farthest entry. Strict '>' preserves the old
-        // first-maximum tie behaviour; an equally distant newcomer is rejected.
-        farthestOccIdx = 0;
-        farthestOccDist2 = odist2[0];
-        for (int k = 1; k < MAX_OCCLUDERS; k++)
-        {
-            if (odist2[k] > farthestOccDist2)
-            {
-                farthestOccIdx = k;
-                farthestOccDist2 = odist2[k];
-            }
-        }
+        // The heap compares distance, then smaller slot first, matching the
+        // previous strict-'>' rescan exactly. Equal newcomers still reject above.
+        farthestOccIdx = farthestOccHeap.afterReplace();
+        farthestOccDist2 = odist2[farthestOccIdx];
     }
 
     private static void collect(ClientWorld world, Vec3d cameraPos, float tickDelta)
@@ -2397,6 +2630,52 @@ public final class ShadowBaker
         occCount = 0;
         farthestOccIdx = 0;
         farthestOccDist2 = Float.NEGATIVE_INFINITY;
+        farthestOccHeap.reset();
+        Arrays.fill(spotMembersBySlot, null);
         ShadowEngine.source().collect(world, cameraPos, tickDelta, SINK);
+        for (int k = 0; k < occCount; k++)
+        {
+            CasterRevision revision = CasterRevision.UNKNOWN;
+            if (!oStatic[k] && !NO_OVERLAY_REUSE && ShadowEngine.config().shadowCache())
+            {
+                try
+                {
+                    revision = ShadowEngine.source().revision(occ[k], occType[k], tickDelta);
+                }
+                catch (RuntimeException | LinkageError unavailable)
+                {
+                    // Optional host capability failure changes cost, never correctness.
+                }
+            }
+            oRevision[k] = revision == null ? CasterRevision.UNKNOWN : revision;
+            if (!oStatic[k]) probeCount(oRevision[k].known() ? "caster.known" : "caster.unknown", 1);
+        }
+        Arrays.fill(occ, occCount, MAX_OCCLUDERS, null);
+        Arrays.fill(oRevision, occCount, MAX_OCCLUDERS, null);
+    }
+
+    private static boolean staticBaseCurrent(long id, long sig, int tile,
+                                             List<BlockShadowEntry> blocks, boolean hasStatic)
+    {
+        return !hasStatic || (lastStaticTile.containsKey(id) && lastStaticTile.get(id) == tile
+            && lastStaticSig.get(id) == sig && lastStaticBlocks.get(id) == blocks);
+    }
+
+    /** Filter-only recreation can discard derived content while keeping depth. */
+    public static void invalidateOverlays()
+    {
+        spotOverlays.clear();
+        pointOverlays.clear();
+    }
+
+    private static long overlayPolicy(double x, double y, double z)
+    {
+        // The renderer subtracts the DOUBLE light anchor. Preserve sub-float
+        // movement at distant world coordinates as well as live scissor settings.
+        long h = mix64(Double.doubleToLongBits(x));
+        h = mix64(h ^ Double.doubleToLongBits(y));
+        h = mix64(h ^ Double.doubleToLongBits(z));
+        h = mix64(h ^ Float.floatToIntBits(ShadowEngine.config().shadowPoseReach()));
+        return mix64(h ^ (ShadowEngine.config().shadowPartialTile() ? 1L : 0L));
     }
 }

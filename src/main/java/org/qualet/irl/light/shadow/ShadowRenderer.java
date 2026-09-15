@@ -127,6 +127,11 @@ public final class ShadowRenderer
      *  source's world-space POSITION triangles into {@link #casterAccum}. */
     private static final RawOccluderBatch casterBatch = new RawOccluderBatch();
 
+    private static long casterFailures;
+
+    /** Monotonic failure stamp: a recovered partial draw must never be cached. */
+    public static long casterFailures() { return casterFailures; }
+
     private ShadowRenderer()
     {}
 
@@ -351,6 +356,7 @@ public final class ShadowRenderer
         }
         catch (Throwable t)
         {
+            casterFailures++;
             // The caster threw mid-append: rewind its partial run to the mark so it
             // ends at a whole-caster boundary instead of merging into the next one.
             casterBatch.terminateRun(currentView, currentProj);

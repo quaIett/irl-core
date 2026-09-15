@@ -399,6 +399,12 @@ public final class PointShadowEvsm
         return capBlocks[t];
     }
 
+    static boolean readyForReuse(int tier, int local)
+    {
+        return capBlocks[tier] > local && texId[tier] != 0 && tempId != 0
+            && progConvert != 0 && progBlur != 0 && progMip != 0;
+    }
+
     /** True when the compute programs failed to build — this filter will
      *  never allocate or dispatch, so it must not constrain the budget. */
     static boolean inert()
@@ -629,6 +635,7 @@ public final class PointShadowEvsm
      *  safe — 2D-array/cube-array bindings are not tracked by GlStateManager. */
     public static void delete()
     {
+        ShadowBaker.invalidateOverlays();
         for (int t = 0; t < 3; t++)
         {
             if (viewId[t] != 0)
