@@ -16,21 +16,22 @@ import java.nio.ByteBuffer;
  *   layout(std140, binding = BINDING) uniform IrliteVlGlobals {
  *       vec4 irlite_vlA;   // x = intensity, y = maxDist, z = tipBoost, w = tipRadius
  *       vec4 irlite_vlB;   // x = noiseAmount, y = noiseScale, z = noiseSpeed, w = frameIndex (wraps at 4096)
- *       uvec4 irlite_vlC;  // x = stepMax, y = shadowStride, z = noiseStride, w = flags (bit0 = VL shadows, bit1 = VL noise, bit2 = blue-noise dither, bit3 = temporal dither rotation, bit4 = VL cluster culling, bit5 = VL shadow Hi-Z segment skip, bit6 = depth-aware bilateral upsample, bit7 = GLOBALS VALID, bit8 = outline, bit9 = outline front, bit10 = outline glow, bits11-12 = outline target, bit13 = surface/outline shadows DISABLED)
+ *       uvec4 irlite_vlC;  // x = stepMax, y = shadowStride, z = noiseStride, w = flags (bit0 = VL shadows, bit1 = VL noise, bit2 = blue-noise dither, bit3 = temporal dither rotation, bit4 = VL cluster culling, bit5 = VL shadow Hi-Z segment skip, bit6 = depth-aware bilateral upsample, bit7 = GLOBALS VALID, bit8 = outline, bit9 = outline front, bit10 = outline glow, bits11-12 = outline target, bit13 = surface/outline shadows DISABLED, bit14 = SURFACE VALID, bit15 = diffuse, bit16 = specular, bit17 = toon)
  *       vec4 irlite_vlD;   // x = noiseMorph (0 = morph off), y = bilateral depth sigma in blocks (0 = shader default), z/w = reserved1/2 (written as 0)
  *       vec4 irlite_vlE;   // outline: x = strength, y = fresnelPower, z = back, w = frontStrength
  *       vec4 irlite_vlF;   // x = outline glowStrength, y = outline pixelSize (int-valued), z = shadow light size, w = reserved (written as 0)
+ *       vec4 irlite_vlG;   // surface: x = master intensity (diffuse, specular, outline), y = specular intensity, z = toon bands (int-valued), w = toon smoothing
  *   };
  *
- * Growing the block in the TAIL is binary-safe: std140 offsets 0..63 do not move,
- * so a pack built against the 4-vec4 version keeps reading the same bytes out of
- * the larger buffer. Never reorder existing fields or bits 0..6.
+ * Growing the block in the TAIL is binary-safe: existing std140 offsets do not
+ * move, so a pack built against a shorter version keeps reading the same bytes
+ * out of the larger buffer. Never reorder existing fields or bits.
  */
 public final class VlGlobalsBuffer
 {
     public static final int BINDING = 7;
 
-    private static final int CAPACITY = 96;     // 6 × vec4 (std140)
+    private static final int CAPACITY = 112;    // 7 × vec4 (std140)
 
     /** vlC.w bit7. Set on every upload (never via a setter, so it cannot be
      *  forgotten): it tells the shader the whole block carries real data. An
@@ -38,6 +39,11 @@ public final class VlGlobalsBuffer
      *  to its compile-time define. A zero sentinel cannot serve here — 0 is a
      *  legal user value for most of the outline scalars. */
     private static final int FLAG_GLOBALS_VALID = 1 << 7;
+
+    /** vlC.w bit14, set on every upload like bit7. Vouches for vlG and flag bits
+     *  15..17 specifically: a core from before that block still sets bit7 but has
+     *  no vlG at all, so the shader must not read the surface knobs off bit7. */
+    private static final int FLAG_SURFACE_VALID = 1 << 14;
 
     private static int ubo = 0;
     private static ByteBuffer scratch = null;
@@ -82,6 +88,14 @@ public final class VlGlobalsBuffer
     // shader must read as "not disabled" — hence the inverted sense is the
     // fail-safe one: absence of the bit keeps shadows on, never silently off.
     private static int shadowFlags = 0;                // surface/outline shadows on
+
+    // Surface block (wave 2). Defaults mirror the pack's fallback: diffuse and
+    // specular on, toon off. Own flags word for the same reason as outlineFlags.
+    private static float surfaceIntensity = 1F;        // IRLITE_INTENSITY 1.0
+    private static float specularIntensity = 1F;       // IRLITE_SPECULAR_INTENSITY 1.0
+    private static float toonBands = 3F;               // IRLITE_TOON_BANDS 3
+    private static float toonSmooth = 0.10F;           // IRLITE_TOON_SMOOTH 0.10
+    private static int surfaceFlags = (1 << 15) | (1 << 16);   // diffuse on, specular on, toon off
 
     /** Frame counter for the temporal dither rotation (flags bit3): written to
      *  irlite_vlB.w each upload, wrapped to 12 bits so the float stays exact.
@@ -162,6 +176,22 @@ public final class VlGlobalsBuffer
         VlGlobalsBuffer.shadowFlags = enabled ? 0 : 1 << 13;   // bit13 = DISABLED (see field comment)
     }
 
+    /** Pushes the surface lighting knobs. intensity scales diffuse, specular and
+     *  the outline rim; specularIntensity stacks on top for the highlight only.
+     *  toonBands is clamped to the 2..8 the pack's option offered (the shader
+     *  divides by it), toonSmooth to 0..1. Negative or NaN intensities read as 0. */
+    public static void setSurface(boolean diffuse, float intensity, boolean specular, float specularIntensity,
+                                  boolean toon, int toonBands, float toonSmooth)
+    {
+        VlGlobalsBuffer.surfaceIntensity = intensity >= 0F ? intensity : 0F;
+        VlGlobalsBuffer.specularIntensity = specularIntensity >= 0F ? specularIntensity : 0F;
+        VlGlobalsBuffer.toonBands = Math.max(2, Math.min(8, toonBands));
+        VlGlobalsBuffer.toonSmooth = toonSmooth >= 0F ? Math.min(1F, toonSmooth) : 0F;
+        VlGlobalsBuffer.surfaceFlags = (diffuse ? 1 << 15 : 0)
+            | (specular ? 1 << 16 : 0)
+            | (toon ? 1 << 17 : 0);
+    }
+
     public static void upload()
     {
         if (!initialized)
@@ -172,10 +202,11 @@ public final class VlGlobalsBuffer
         scratch.clear();
         scratch.putFloat(intensity).putFloat(maxDist).putFloat(tipBoost).putFloat(tipRadius);
         scratch.putFloat(noiseAmount).putFloat(noiseScale).putFloat(noiseSpeed).putFloat(frameIndex);  // w = frameIndex
-        scratch.putInt(stepMax).putInt(shadowStride).putInt(noiseStride).putInt(flags | outlineFlags | shadowFlags | FLAG_GLOBALS_VALID);
+        scratch.putInt(stepMax).putInt(shadowStride).putInt(noiseStride).putInt(flags | outlineFlags | shadowFlags | surfaceFlags | FLAG_GLOBALS_VALID | FLAG_SURFACE_VALID);
         scratch.putFloat(noiseMorph).putFloat(0F).putFloat(0F).putFloat(0F);  // vlD: x = noiseMorph, y = bilateral sigma (0 = shader default, no setter yet), z/w reserved
         scratch.putFloat(outlineStrength).putFloat(outlineFresnelPower).putFloat(outlineBack).putFloat(outlineFrontStrength);  // vlE
         scratch.putFloat(outlineGlowStrength).putFloat(outlinePixelSize).putFloat(shadowSize).putFloat(0F);  // vlF: w reserved
+        scratch.putFloat(surfaceIntensity).putFloat(specularIntensity).putFloat(toonBands).putFloat(toonSmooth);  // vlG
         scratch.flip();
 
         frameIndex = (frameIndex + 1) & 4095;   // one tick per upload = per frame
