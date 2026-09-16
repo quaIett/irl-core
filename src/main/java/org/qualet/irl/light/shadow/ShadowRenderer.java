@@ -56,6 +56,9 @@ public final class ShadowRenderer
     private static final int[] savedViewport = new int[4];
     private static boolean savedScissorEnabled;
     private static final int[] savedScissorBox = new int[4];
+    private static boolean savedCullEnabled;
+    private static int savedCullFace;
+    private static int savedFrontFace;
     private static Matrix4f savedProj;
     private static VertexSorter savedSorter;
     private static boolean savedMaskR, savedMaskG, savedMaskB, savedMaskA;
@@ -565,7 +568,7 @@ public final class ShadowRenderer
         {
             if (disabledCull)
             {
-                RenderSystem.enableCull();   // restore MC's default (back-face cull)
+                restoreCullState();
             }
             ShadowBakeState.setBaking(false);
         }
@@ -959,6 +962,7 @@ public final class ShadowRenderer
         RenderSystem.setProjectionMatrix(savedProj, savedSorter);
 
         GL11.glColorMask(savedMaskR, savedMaskG, savedMaskB, savedMaskA);
+        restoreCullState();
 
         if (savedScissorEnabled)
         {
@@ -996,6 +1000,13 @@ public final class ShadowRenderer
         }
         savedProj = RenderSystem.getProjectionMatrix();
         savedSorter = RenderSystem.getVertexSorting();
+        // BBS model/BOBJ renderers may change culling while they are replayed as
+        // shadow casters. Merely re-enabling culling is insufficient: a leaked
+        // GL_FRONT selector (or flipped winding) makes the following world pass
+        // show only the inside faces of every model. Preserve the complete state.
+        savedCullEnabled = GL11.glIsEnabled(GL11.GL_CULL_FACE);
+        savedCullFace = GL11.glGetInteger(GL11.GL_CULL_FACE_MODE);
+        savedFrontFace = GL11.glGetInteger(GL11.GL_FRONT_FACE);
 
         try (org.lwjgl.system.MemoryStack stack = org.lwjgl.system.MemoryStack.stackPush())
         {
@@ -1008,6 +1019,21 @@ public final class ShadowRenderer
         }
 
         passStateSaved = true;
+    }
+
+    private static void restoreCullState()
+    {
+        GL11.glCullFace(savedCullFace);
+        GL11.glFrontFace(savedFrontFace);
+
+        if (savedCullEnabled)
+        {
+            RenderSystem.enableCull();
+        }
+        else
+        {
+            RenderSystem.disableCull();
+        }
     }
 
     private static void applyMatrices(Matrix4f proj)
