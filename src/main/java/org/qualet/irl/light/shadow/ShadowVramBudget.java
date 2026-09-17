@@ -165,6 +165,25 @@ public final class ShadowVramBudget
      *  the cap never regresses below a handed-out block. */
     public static void updatePointCaps()
     {
+        // Full physical arrays cannot grow, and the policy never shrinks them.
+        // Avoid a driver free-VRAM query when its answer cannot affect any cap.
+        boolean fullyBacked = true;
+        for (int t = 0; t < 3; t++)
+        {
+            int full = PointDepthAtlas.tierBlockCount(t);
+            if (physicalPointBlocks(t) < full)
+            {
+                fullyBacked = false;
+            }
+            else
+            {
+                approvedBlocks[t] = full;
+            }
+        }
+        if (fullyBacked)
+        {
+            return;
+        }
         int t0Face = PointDepthAtlas.getTileSize();
         long free = freeVramBytes();
         long headroom = free < 0 ? Long.MAX_VALUE / 4 : free - RESERVE_BYTES;

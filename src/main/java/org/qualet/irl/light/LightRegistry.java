@@ -16,6 +16,8 @@ public final class LightRegistry
     private static final int MAX = LightBuffer.MAX_LIGHTS;
 
     private static final int[] type = new int[MAX];
+    private static final LightProfile[] profiles = new LightProfile[MAX];
+    private static final boolean[] hasProfile = new boolean[MAX];
     // Absolute world positions, kept in DOUBLE so a light far from origin (e.g.
     // X=100000) is not float-quantized before the camera-relative flush subtracts
     // the eye. getX/Y/Z narrow to float for the shadow baker (translation-invariant,
@@ -119,6 +121,7 @@ public final class LightRegistry
         }
 
         type[i] = 0;
+        hasProfile[i] = false;
         px[i] = x; py[i] = y; pz[i] = z;
         cr[i] = r; cg[i] = g; cb[i] = b;
         intensity[i] = in; radius[i] = rad;
@@ -161,6 +164,7 @@ public final class LightRegistry
         }
 
         type[i] = 1;
+        hasProfile[i] = false;
         px[i] = x; py[i] = y; pz[i] = z;
         cr[i] = r; cg[i] = g; cb[i] = b;
         intensity[i] = in; radius[i] = range;
@@ -223,6 +227,27 @@ public final class LightRegistry
         k *= 0xc4ceb9fe1a85ec53L;
         k ^= k >>> 33;
         return (int) k;
+    }
+
+    /** Copies overrides into an already registered source, including deduplicated registrations. */
+    public static void setProfile(long identity, LightProfile profile)
+    {
+        int j = mix64(identity) & (HASH_CAP - 1);
+        for (int probe = 0; probe < HASH_CAP && stamp[j] == generation; probe++)
+        {
+            if (keys[j] == identity)
+            {
+                int i = slots[j];
+                hasProfile[i] = profile != null;
+                if (profile != null)
+                {
+                    if (profiles[i] == null) profiles[i] = new LightProfile();
+                    profiles[i].copyFrom(profile);
+                }
+                return;
+            }
+            j = (j + 1) & (HASH_CAP - 1);
+        }
     }
 
     // --- accessors for the shadow baker (iterate spots, assign tiles) ---
@@ -540,6 +565,7 @@ public final class LightRegistry
             }
 
             uploadedIds[uploadedCount++] = id[i];
+            LightBuffer.addProfile(hasProfile[i] ? profiles[i] : null);
         }
 
         // Snapshot is complete for this frame — mark it fresh so the late

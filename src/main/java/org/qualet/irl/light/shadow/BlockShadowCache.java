@@ -23,8 +23,8 @@ import java.util.List;
  * Avoids re-walking each light's bbox (thousands of getBlockState calls) every
  * frame. Three invalidation triggers:
  *   1. Light moved into another 1-block cell / range crossed a whole block ->
- *      hash mismatch in getOrCompute (checked every frame, cheap; the sphere
- *      is quantized so sub-block motion of a moving lamp does NOT re-collect).
+ *      hash mismatch in getOrCompute, or host block changed (checked every
+ *      frame; sub-block motion reuses the list within both snapped and host cells).
  *   2. A block in range changed -> invalidateChange(world, pos, old, new) from
  *      WorldBlockChangeMixin, via a section index (chunk-section key -> set of
  *      light ids overlapping it), gated on the swap actually altering a
@@ -58,6 +58,8 @@ public final class BlockShadowCache
          *  invalidateAt reject an edit that lies outside the actual sphere, in a
          *  far corner of a section the coarse index merely touched. */
         float cx, cy, cz, cr;
+        int hostX, hostY, hostZ;
+        int minSx, minSy, minSz, maxSx, maxSy, maxSz;
     }
 
     private static final Long2ObjectOpenHashMap<CacheEntry> byId = new Long2ObjectOpenHashMap<>();
@@ -83,8 +85,8 @@ public final class BlockShadowCache
      *  (entity/replay-mounted, or a transform-animated model block) used to
      *  change the raw-float hash EVERY frame and re-walk ~(2r)^3 block states
      *  + rebuild its shadow VBO each time; now it re-collects only when it
-     *  crosses into another 1-block cell (and the cached list instance stays
-     *  stable in between, which the VBO cache keys on). Blocks the padding
+     *  crosses into another snapped or host cell (and the cached list instance
+     *  stays stable in between, which the VBO cache keys on). Blocks the padding
      *  pulls in past the light's range are clipped by the bake far plane. */
     public static List<BlockShadowEntry> getOrCompute(long id, ClientWorld world,
                                                       float lx, float ly, float lz, float radius)
@@ -102,7 +104,9 @@ public final class BlockShadowCache
 
         long h = hash(cx, cy, cz, cr);
         CacheEntry e = byId.get(id);
-        if (e != null && e.hash == h && e.list != null)
+        // round(position) can stay unchanged across a floor(position) boundary.
+        if (e != null && e.hash == h && e.list != null
+            && e.hostX == hostX && e.hostY == hostY && e.hostZ == hostZ)
         {
             return e.list;
         }
@@ -119,6 +123,9 @@ public final class BlockShadowCache
         e.cy = cy;
         e.cz = cz;
         e.cr = cr;
+        e.hostX = hostX;
+        e.hostY = hostY;
+        e.hostZ = hostZ;
         rebuildSectionIndex(id, e, cx, cy, cz, cr);
         return fresh;
     }
@@ -247,15 +254,9 @@ public final class BlockShadowCache
     /** Sections a sphere bbox touches — built from the sphere, NOT the collected
      *  block list, so a block later placed in a currently-empty section still
      *  invalidates this light. */
-    private static long[] computeSectionsForSphere(float lx, float ly, float lz, float r)
+    private static long[] computeSections(int minSx, int minSy, int minSz,
+                                          int maxSx, int maxSy, int maxSz)
     {
-        int minSx = ((int) Math.floor(lx - r)) >> 4;
-        int minSy = ((int) Math.floor(ly - r)) >> 4;
-        int minSz = ((int) Math.floor(lz - r)) >> 4;
-        int maxSx = ((int) Math.floor(lx + r)) >> 4;
-        int maxSy = ((int) Math.floor(ly + r)) >> 4;
-        int maxSz = ((int) Math.floor(lz + r)) >> 4;
-
         int spanX = maxSx - minSx + 1;
         int spanY = maxSy - minSy + 1;
         int spanZ = maxSz - minSz + 1;
@@ -276,11 +277,23 @@ public final class BlockShadowCache
 
     private static void rebuildSectionIndex(long id, CacheEntry e, float lx, float ly, float lz, float r)
     {
+        int minSx = ((int) Math.floor(lx - r)) >> 4;
+        int minSy = ((int) Math.floor(ly - r)) >> 4;
+        int minSz = ((int) Math.floor(lz - r)) >> 4;
+        int maxSx = ((int) Math.floor(lx + r)) >> 4;
+        int maxSy = ((int) Math.floor(ly + r)) >> 4;
+        int maxSz = ((int) Math.floor(lz + r)) >> 4;
+        if (e.sectionKeys != null && e.minSx == minSx && e.minSy == minSy && e.minSz == minSz
+            && e.maxSx == maxSx && e.maxSy == maxSy && e.maxSz == maxSz)
+        {
+            return;
+        }
+
         if (e.sectionKeys != null)
         {
             removeSectionKeys(id, e.sectionKeys);
         }
-        long[] newKeys = computeSectionsForSphere(lx, ly, lz, r);
+        long[] newKeys = computeSections(minSx, minSy, minSz, maxSx, maxSy, maxSz);
         for (long key : newKeys)
         {
             LongOpenHashSet s = sectionToLightIds.get(key);
@@ -292,6 +305,12 @@ public final class BlockShadowCache
             s.add(id);
         }
         e.sectionKeys = newKeys;
+        e.minSx = minSx;
+        e.minSy = minSy;
+        e.minSz = minSz;
+        e.maxSx = maxSx;
+        e.maxSy = maxSy;
+        e.maxSz = maxSz;
     }
 
     private static void removeSectionKeys(long id, long[] keys)

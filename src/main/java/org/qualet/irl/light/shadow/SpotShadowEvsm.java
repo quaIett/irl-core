@@ -160,6 +160,8 @@ public final class SpotShadowEvsm
         return texId;
     }
 
+    static boolean readyForReuse() { return texId != 0 && progConvert != 0 && progBlur != 0 && progMip != 0; }
+
     /** range = the light's far plane, needed to linearize depth before the warp. */
     public static void markDirty(int tile, float range)
     {
@@ -525,6 +527,7 @@ public final class SpotShadowEvsm
      *  goes through GlStateManager — see SpotShadowPyramid.delete(). */
     public static void delete()
     {
+        ShadowBaker.invalidateOverlays();
         if (texId != 0)
         {
             GlStateManager._deleteTexture(texId);
