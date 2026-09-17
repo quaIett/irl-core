@@ -1,0 +1,76 @@
+// Exact pre-heap production method, saved before this optimization (2026-09-11).
+    private static void put(Object caster, int type, boolean isStatic,
+                            float cx, float cy, float cz, float radius,
+                            float rh, float hv, long staticHash)
+    {
+        float ddx = cx - occCamX, ddy = cy - occCamY, ddz = cz - occCamZ;
+        float d2 = ddx * ddx + ddy * ddy + ddz * ddz;
+        // A malformed source must degrade to an absent caster, never poison the
+        // cached argmax (all comparisons against NaN are false) or cull math.
+        if (!Float.isFinite(d2) || !Float.isFinite(radius) || radius < 0f)
+        {
+            return;
+        }
+        // Malformed per-axis extents (NaN / negative) degrade the same way the
+        // whole caster would: to the guaranteed-conservative sphere box.
+        if (!(rh >= 0f) || !(hv >= 0f))
+        {
+            rh = radius;
+            hv = radius;
+        }
+        int idx;
+        boolean replacedFarthest = false;
+        if (occCount < MAX_OCCLUDERS)
+        {
+            idx = occCount++;
+        }
+        else
+        {
+            // Pool full: either branch makes some caster vanish from ALL lights
+            // this frame — the rejected newcomer or the evicted farthest entry.
+            if (ShadowClipTelemetry.ENABLED)
+            {
+                ShadowClipTelemetry.notePoolDrop();
+            }
+            if (d2 >= farthestOccDist2)
+            {
+                return;
+            }
+            idx = farthestOccIdx;
+            replacedFarthest = true;
+        }
+        occ[idx] = caster;
+        occType[idx] = type;
+        oStatic[idx] = isStatic;
+        ox[idx] = cx;
+        oy[idx] = cy;
+        oz[idx] = cz;
+        orad[idx] = radius;
+        orh[idx] = rh;
+        ohv[idx] = hv;
+        ostatichash[idx] = staticHash;
+        odist2[idx] = d2;
+
+        if (!replacedFarthest)
+        {
+            if (d2 > farthestOccDist2)
+            {
+                farthestOccIdx = idx;
+                farthestOccDist2 = d2;
+            }
+            return;
+        }
+
+        // Replaced the cached farthest entry. Strict '>' preserves the old
+        // first-maximum tie behaviour; an equally distant newcomer is rejected.
+        farthestOccIdx = 0;
+        farthestOccDist2 = odist2[0];
+        for (int k = 1; k < MAX_OCCLUDERS; k++)
+        {
+            if (odist2[k] > farthestOccDist2)
+            {
+                farthestOccIdx = k;
+                farthestOccDist2 = odist2[k];
+            }
+        }
+    }

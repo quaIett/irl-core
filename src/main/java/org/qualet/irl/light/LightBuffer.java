@@ -79,6 +79,7 @@ public final class LightBuffer
         }
 
         count = 0;
+        LightProfilesBuffer.begin();
         scratch.clear();
         scratch.position(HEADER_BYTES);
     }
@@ -144,14 +145,16 @@ public final class LightBuffer
         scratch.putInt(0, count);
         scratch.putFloat(4, vlGlobalIntensity);
         scratch.putInt(8, vlFlags);
+        scratch.putInt(12, LightProfilesBuffer.MAGIC);
 
         int used = scratch.position();
         scratch.position(0);
         scratch.limit(used);
 
-        GL15.glBindBuffer(GL43.GL_SHADER_STORAGE_BUFFER, ssbo);
-        GL15.glBufferSubData(GL43.GL_SHADER_STORAGE_BUFFER, 0L, scratch);
+        // BindBufferBase also sets the generic target used by BufferSubData.
         GL30.glBindBufferBase(GL43.GL_SHADER_STORAGE_BUFFER, BINDING, ssbo);
+        LightProfilesBuffer.prepare(count);
+        GL15.glBufferSubData(GL43.GL_SHADER_STORAGE_BUFFER, 0L, scratch);
         GL15.glBindBuffer(GL43.GL_SHADER_STORAGE_BUFFER, 0);
 
         scratch.clear();
@@ -190,5 +193,11 @@ public final class LightBuffer
         initialized = false;
 
         VlGlobalsBuffer.delete();
+        LightProfilesBuffer.delete();
+    }
+
+    static void addProfile(LightProfile profile)
+    {
+        LightProfilesBuffer.add(profile);
     }
 }

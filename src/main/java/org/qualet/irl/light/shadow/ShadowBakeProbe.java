@@ -23,4 +23,10 @@ public interface ShadowBakeProbe
 
     /** Add {@code amount} to the window counter {@code key}. */
     void counter(String key, int amount);
+
+    /** Opt in to repeated copy/draw segments; consumers must sum them per frame. */
+    default boolean detailedTimings()
+    {
+        return false;
+    }
 }

@@ -53,10 +53,9 @@ public final class ClusterGridBuffer
      *  no bits THERE. Old-generation patched packs read only this region, so it
      *  stays in the layout and keeps being dual-written (first 64 bits). */
     public static final int MASK_LIGHTS = 64;
-    /** W2 wide region (red-line experiment): words-per-tile of the full-width
-     *  mask — EVERY packed light up to {@link LightBuffer#MAX_LIGHTS} gets a
-     *  bit, killing the 64-light cluster ceiling. Header .w carries this value
-     *  so the shader can gate on it (0 = legacy-only mod, full-loop fallback). */
+    /** Maximum words per tile in the W2 region. Every packed light gets a bit;
+     *  header .w carries the current frame's compact stride, at most this value
+     *  (0 remains the legacy-only writer / full-loop fallback sentinel). */
     public static final int WIDE_WORDS = (LightBuffer.MAX_LIGHTS + 31) / 32;   // 64; ceil so WIDE_LIGHTS >= MAX_LIGHTS by construction
     public static final int WIDE_LIGHTS = WIDE_WORDS * 32;                     // 2048
     /** View-space near plane used by the mask projection (the pilot's NEAR). */
@@ -114,8 +113,13 @@ public final class ClusterGridBuffer
     // --- Mask accumulator (CPU-side, reused; row-major ty*GRID_X+tx) ---------
     private static final int[] maskX = new int[TILE_COUNT];  // legacy bits 0..31
     private static final int[] maskY = new int[TILE_COUNT];  // legacy bits 32..63
-    // W2 full-width words, tile-major [t * WIDE_WORDS + (bit >> 5)].
+    // W2 words, tile-major [t * activeWords + (bit >> 5)]. Capacity stays at
+    // the maximum, but only the current frame's packed prefix is touched/uploaded.
     private static final int[] wide = new int[TILE_COUNT * WIDE_WORDS];
+    private static int activeWords = 1;
+    // Lights covering the entire screen share one OR per word here, applied to
+    // each tile after projection instead of visiting all 576 tiles per light.
+    private static final int[] floodWords = new int[WIDE_WORDS];
 
     // Reused transform scratch — buildAndUpload stays allocation-free per frame.
     private static final Vector4f v4 = new Vector4f();
@@ -159,6 +163,10 @@ public final class ClusterGridBuffer
     public static void setEnabled(boolean value)
     {
         enabled = value;
+        if (!value)
+        {
+            begin();
+        }
     }
 
     public static boolean isEnabled()
@@ -171,6 +179,7 @@ public final class ClusterGridBuffer
     public static void begin()
     {
         snapCount = 0;
+        snapshotFresh = false;
     }
 
     /** Record one packed light for this frame's mask rasterisation. {@code bit} is
@@ -226,12 +235,15 @@ public final class ClusterGridBuffer
 
         Arrays.fill(maskX, 0);
         Arrays.fill(maskY, 0);
-        Arrays.fill(wide, 0);
+        activeWords = Math.max(1, (snapCount + 31) / 32);
+        Arrays.fill(wide, 0, TILE_COUNT * activeWords, 0);
+        Arrays.fill(floodWords, 0, activeWords, 0);
 
         for (int b = 0; b < snapCount; b++)
         {
             rasterizeLight(b, modelView, projection);
         }
+        applyFloodWords();
 
         writeAndUpload(1);
         lastUploadState = STATE_ACTIVE;
@@ -330,11 +342,30 @@ public final class ClusterGridBuffer
 
     private static void setAllTiles(int bit)
     {
-        int word = bit >> 5;
-        int m = 1 << (bit & 31);
-        for (int t = 0; t < TILE_COUNT; t++)
+        floodWords[bit >> 5] |= 1 << (bit & 31);
+    }
+
+    private static void applyFloodWords()
+    {
+        for (int word = 0; word < activeWords; word++)
         {
-            setTileBit(t, word, bit, m);
+            int mask = floodWords[word];
+            if (mask == 0)
+            {
+                continue;
+            }
+            for (int t = 0; t < TILE_COUNT; t++)
+            {
+                wide[t * activeWords + word] |= mask;
+                if (word == 0)
+                {
+                    maskX[t] |= mask;
+                }
+                else if (word == 1)
+                {
+                    maskY[t] |= mask;
+                }
+            }
         }
     }
 
@@ -343,7 +374,7 @@ public final class ClusterGridBuffer
      *  {@value #MASK_LIGHTS} bits (old-generation packs read only that). */
     private static void setTileBit(int t, int word, int bit, int m)
     {
-        wide[t * WIDE_WORDS + word] |= m;
+        wide[t * activeWords + word] |= m;
         if (bit < 32)
         {
             maskX[t] |= m;
@@ -354,12 +385,13 @@ public final class ClusterGridBuffer
         }
     }
 
-    /** Fill the whole scratch (header + all masks) and push it to the SSBO, binding
-     *  it at binding {@value #BINDING}. */
+    /** Upload header + fixed legacy region + compact wide prefix. All W2 readers
+     *  address tiles through header.w; legacy readers retain the same uvec2[576]
+     *  at byte 16 and never read the wide region. No shader regeneration needed. */
     private static void writeAndUpload(int flags)
     {
         scratch.clear();
-        scratch.putInt(GRID_X).putInt(GRID_Y).putInt(flags).putInt(WIDE_WORDS);
+        scratch.putInt(GRID_X).putInt(GRID_Y).putInt(flags).putInt(activeWords);
         for (int t = 0; t < TILE_COUNT; t++)
         {
             scratch.putInt(maskX[t]).putInt(maskY[t]);
@@ -368,14 +400,14 @@ public final class ClusterGridBuffer
         // loop over 36,864 words would cost real per-frame CPU; a per-frame
         // asIntBuffer() would allocate). The view is anchored at the wide region's
         // fixed offset and shares the scratch buffer's native byte order.
+        int wideInts = TILE_COUNT * activeWords;
         wideView.clear();
-        wideView.put(wide);
-        scratch.position(scratch.position() + WIDE_BYTES);
+        wideView.put(wide, 0, wideInts);
+        scratch.position(scratch.position() + wideInts * Integer.BYTES);
         scratch.flip();
 
-        GL15.glBindBuffer(GL43.GL_SHADER_STORAGE_BUFFER, ssbo);
-        GL15.glBufferSubData(GL43.GL_SHADER_STORAGE_BUFFER, 0L, scratch);
         GL30.glBindBufferBase(GL43.GL_SHADER_STORAGE_BUFFER, BINDING, ssbo);
+        GL15.glBufferSubData(GL43.GL_SHADER_STORAGE_BUFFER, 0L, scratch);
         GL15.glBindBuffer(GL43.GL_SHADER_STORAGE_BUFFER, 0);
 
         scratch.clear();
@@ -401,9 +433,10 @@ public final class ClusterGridBuffer
      *  assume nothing else rebound the point since the last EMPTY.</p> */
     public static void uploadEmpty()
     {
+        begin();
         init();
 
-        GL15.glBindBuffer(GL43.GL_SHADER_STORAGE_BUFFER, ssbo);
+        GL30.glBindBufferBase(GL43.GL_SHADER_STORAGE_BUFFER, BINDING, ssbo);
 
         if (lastUploadState != STATE_EMPTY)
         {
@@ -417,12 +450,12 @@ public final class ClusterGridBuffer
             lastUploadState = STATE_EMPTY;
         }
 
-        GL30.glBindBufferBase(GL43.GL_SHADER_STORAGE_BUFFER, BINDING, ssbo);
         GL15.glBindBuffer(GL43.GL_SHADER_STORAGE_BUFFER, 0);
     }
 
     public static void delete()
     {
+        begin();
         if (ssbo != 0)
         {
             GL15.glDeleteBuffers(ssbo);
