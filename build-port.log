@@ -1,0 +1,115 @@
+
+> Configure project :
+Fabric Loom: 1.9.2
+:remapping 1 mods from modCompileOnly (java-api)
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/immediate/model/BakedModelEncoder
+[WARN]  [MIXIN] Cannot remap writeQuadVertices because it does not exists in any of the targets [] or their parents.
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/vertex/buffer/SodiumBufferBuilder
+[WARN]  [MIXIN] Cannot remap ATTRIBUTE_NOT_PRESENT because it does not exists in any of the targets [] or their parents.
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/vertex/buffer/SodiumBufferBuilder
+[WARN]  [MIXIN] Cannot remap ATTRIBUTE_NORMAL_BIT because it does not exists in any of the targets [] or their parents.
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/vertex/buffer/SodiumBufferBuilder
+[WARN]  [MIXIN] Cannot remap builder because it does not exists in any of the targets [] or their parents.
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/vertex/buffer/SodiumBufferBuilder
+[WARN]  [MIXIN] Cannot remap attributeOffsetPosition because it does not exists in any of the targets [] or their parents.
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/vertex/buffer/SodiumBufferBuilder
+[WARN]  [MIXIN] Cannot remap attributeOffsetTexture because it does not exists in any of the targets [] or their parents.
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/vertex/buffer/SodiumBufferBuilder
+[WARN]  [MIXIN] Cannot remap attributeOffsetNormal because it does not exists in any of the targets [] or their parents.
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/vertex/buffer/SodiumBufferBuilder
+[WARN]  [MIXIN] Cannot remap requiredAttributes because it does not exists in any of the targets [] or their parents.
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/vertex/buffer/SodiumBufferBuilder
+[WARN]  [MIXIN] Cannot remap writtenAttributes because it does not exists in any of the targets [] or their parents.
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/vertex/buffer/SodiumBufferBuilder
+[WARN]  [MIXIN] Cannot remap getOriginalBufferBuilder because it does not exists in any of the targets [] or their parents.
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/vertex/buffer/SodiumBufferBuilder
+[WARN]  [MIXIN] Cannot remap putNormalAttribute because it does not exists in any of the targets [] or their parents.
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/gl/attribute/GlVertexFormat$Builder
+[WARN]  [MIXIN] Cannot remap stride because it does not exists in any of the targets [] or their parents.
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/gl/attribute/GlVertexFormat$Builder
+[WARN]  [MIXIN] Cannot remap attributes because it does not exists in any of the targets [] or their parents.
+[ERROR] [MIXIN] Cannot resolve class net/caffeinemc/mods/sodium/api/vertex/attributes/CommonVertexAttribute
+[WARN]  [MIXIN] Cannot remap COUNT because it does not exists in any of the targets [] or their parents.
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/SodiumWorldRenderer
+[WARN]  [MIXIN] Cannot remap invokeRenderBlockEntities because it does not exists in any of the targets [] or their parents.
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/SodiumWorldRenderer
+[WARN]  [MIXIN] Cannot remap invokeRenderGlobalBlockEntities because it does not exists in any of the targets [] or their parents.
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/SodiumWorldRenderer
+[WARN]  [MIXIN] Cannot remap renderBlockEntity because it does not exists in any of the targets [] or their parents.
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/chunk/RenderSectionManager
+[WARN]  [MIXIN] Cannot remap renderLists because it does not exists in any of the targets [] or their parents.
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/immediate/CloudRenderer
+[WARN]  [MIXIN] Cannot remap shader because it does not exists in any of the targets [] or their parents.
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/immediate/CloudRenderer
+[WARN]  [MIXIN] Cannot remap fogData because it does not exists in any of the targets [] or their parents.
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/immediate/CloudRenderer
+[WARN]  [MIXIN] Cannot remap rebuildGeometry because it does not exists in any of the targets [] or their parents.
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/immediate/CloudRenderer
+[WARN]  [MIXIN] Cannot remap applyFogModifiers because it does not exists in any of the targets [] or their parents.
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/chunk/vertex/builder/ChunkMeshBufferBuilder
+[WARN]  [MIXIN] Cannot remap encoder because it does not exists in any of the targets [] or their parents.
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/chunk/compile/ChunkBuildBuffers
+[WARN]  [MIXIN] Cannot remap builders because it does not exists in any of the targets [] or their parents.
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/chunk/compile/buffers/BakedChunkModelBuilder
+[WARN]  [MIXIN] Cannot remap vertexBuffers because it does not exists in any of the targets [] or their parents.
+
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/chunk/vertex/format/ChunkMeshAttribute
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/immediate/model/BakedModelEncoder
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/chunk/RenderSectionManager
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/chunk/compile/executor/ChunkBuilder
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/model/light/smooth/SmoothLightPipeline
+[WARN]  [MIXIN] Cannot remap getRendertypeTranslucentNoCrumblingShader because it does not exists in any of the targets [net/minecraft/class_757]
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/model/light/flat/FlatLightPipeline
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/vertex/VertexFormatDescriptionImpl
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/SodiumWorldRenderer
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/SodiumWorldRenderer
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/SodiumWorldRenderer
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/SodiumWorldRenderer
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/SodiumWorldRenderer
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/SodiumWorldRenderer
+[ERROR] [MIXIN] Cannot resolve class net/caffeinemc/mods/sodium/api/vertex/attributes/CommonVertexAttribute
+[WARN]  [MIXIN] Cannot remap sodium$moveToNextVertex because it does not exists in any of the targets [net/minecraft/class_287]
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/gl/shader/ShaderType
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/gl/attribute/GlVertexAttributeFormat
+[ERROR] [MIXIN] Cannot resolve class org/lwjgl/glfw/GLFW
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/vertex/buffer/SodiumBufferBuilder
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/gui/SodiumOptionsGUI
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/immediate/CloudRenderer
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/immediate/CloudRenderer
+[ERROR] [MIXIN] Cannot resolve class org/lwjgl/system/MemoryStack
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/immediate/CloudRenderer
+[ERROR] [MIXIN] Cannot resolve class net/caffeinemc/mods/sodium/api/vertex/buffer/VertexBufferWriter
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/chunk/RenderSectionManager
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/chunk/RenderSectionManager
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/chunk/RenderSectionManager
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/chunk/RenderSectionManager
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/chunk/compile/tasks/ChunkBuilderMeshingTask
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/chunk/compile/tasks/ChunkBuilderMeshingTask
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/chunk/compile/tasks/ChunkBuilderMeshingTask
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/chunk/compile/pipeline/FluidRenderer
+[ERROR] [MIXIN] Cannot resolve class me/jellysquid/mods/sodium/client/render/chunk/compile/tasks/ChunkBuilderMeshingTask
+
+> Task :compileJava
+> Task :processResources
+> Task :classes
+> Task :compileTestJava NO-SOURCE
+> Task :jar
+> Task :processIncludeJars
+> Task :sourcesJar
+> Task :generatePomFileForMavenJavaPublication
+> Task :remapJar
+> Task :remapSourcesJar
+> Task :generateMetadataFileForMavenJavaPublication
+> Task :publishMavenJavaPublicationToMavenLocal
+> Task :publishToMavenLocal
+
+[Incubating] Problems report is available at: file:///C:/Users/qualet/Documents/Project/Minecraft/BBS/_wt-irl-core-1.20.x/build/reports/problems/problems-report.html
+
+Deprecated Gradle features were used in this build, making it incompatible with Gradle 10.
+
+You can use '--warning-mode all' to show the individual deprecation warnings and determine if they come from your own scripts or plugins.
+
+For more on this, please refer to https://docs.gradle.org/9.2.0/userguide/command_line_interface.html#sec:command_line_warnings in the Gradle documentation.
+
+BUILD SUCCESSFUL in 17s
+10 actionable tasks: 10 executed
