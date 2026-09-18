@@ -4,3 +4,8 @@
 
 # Local build/verification logs
 *.log
+
+# AI assistant memory and local config - not for publication
+/memory/
+/.claude/
+/CLAUDE.md
